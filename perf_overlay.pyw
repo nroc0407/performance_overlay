@@ -46,6 +46,9 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOPMOST = 0x00000008
+HWND_TOPMOST = -1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
 
 
 def load_color(pct):
@@ -711,8 +714,19 @@ class Overlay:
 
     def _tick(self):
         self._update()
-        self.root.attributes("-topmost", True)  # re-assert in case another window took it
+        self._keep_topmost()
         self.root.after(INTERVAL_MS, self._tick)
+
+    def _keep_topmost(self):
+        """Re-pin only if something actually dropped us out of the topmost band.
+
+        Re-raising on every tick would cover topmost windows opened later, such
+        as the Win+Shift+S capture screen, making screenshots look broken.
+        """
+        u = ctypes.windll.user32
+        if not u.GetWindowLongW(self.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST:
+            u.SetWindowPos(self.hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
     def _update(self):
         """Refresh what's shown; game mode doesn't measure CPU or disks at all."""
