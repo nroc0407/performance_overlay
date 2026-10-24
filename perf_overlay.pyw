@@ -4,8 +4,9 @@ throughput and free disk space.
 - The overlay ignores the mouse (clicks pass through to whatever is below).
 - Clicking the tray icon (taskbar, bottom-right) opens a settings popup:
   show/hide the overlay for a while, game mode (RAM / GPU / NET only), edit mode (drag to move), reset position,
-  opacity, run at startup, exit. Right-click the icon for quick toggles.
-  In edit mode, double-click the overlay (or press 완료 in the popup) to finish.
+  opacity, run at startup, language (Korean / English), exit. Right-click the
+  icon for quick toggles. In edit mode, double-click the overlay (or press
+  Done in the popup) to finish.
 - Settings live in perf_overlay.json next to this script ("drives" picks
   which drives to show).
 
@@ -49,6 +50,62 @@ WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOPMOST = 0x00000008
 HWND_TOPMOST = -1
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+
+STRINGS = {
+    "ko": {
+        "show": "오버레이 표시",
+        "show_sub": "끄면 다시 켤 때까지 숨김",
+        "game": "게임 모드",
+        "game_sub": "RAM · GPU · 네트워크만 한 줄로 표시",
+        "position": "위치",
+        "move": "위치 편집",
+        "done": "완료",
+        "top_right": "우측 상단으로",
+        "move_hint": "오버레이를 드래그해서 옮기세요. 더블클릭해도 완료됩니다.",
+        "opacity": "투명도",
+        "startup": "Windows 시작 시 실행",
+        "language": "언어",
+        "quit": "종료",
+        "settings": "설정",
+        "move_mode": "위치 편집 모드",
+        "hidden_tip": "Perf Overlay (숨김)",
+        "game_tip": "[게임 모드]",
+        "threads": "{n} 스레드",
+        "disk_used": "{pct}% 사용 / {total}",
+        "disk_free": "{free} 여유",
+    },
+    "en": {
+        "show": "Show overlay",
+        "show_sub": "Hidden until you turn it back on",
+        "game": "Game mode",
+        "game_sub": "Just RAM · GPU · network on one line",
+        "position": "Position",
+        "move": "Move",
+        "done": "Done",
+        "top_right": "Snap to top-right",
+        "move_hint": "Drag the overlay to move it. Double-click it to finish.",
+        "opacity": "Opacity",
+        "startup": "Start with Windows",
+        "language": "Language",
+        "quit": "Quit",
+        "settings": "Settings",
+        "move_mode": "Move mode",
+        "hidden_tip": "Perf Overlay (hidden)",
+        "game_tip": "[Game mode]",
+        "threads": "{n} threads",
+        "disk_used": "{pct}% of {total}",
+        "disk_free": "{free} free",
+    },
+}
+LANGUAGES = [("ko", "한국어"), ("en", "English")]
+
+
+def default_language():
+    """Korean if Windows' UI language is Korean (primary language id 0x12), else English."""
+    try:
+        return "ko" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x12 else "en"
+    except Exception:
+        return "en"
 
 
 def load_color(pct):
@@ -255,12 +312,12 @@ class SettingsPopup:
     """Flyout-style settings window shown above the tray, like Windows' own flyouts.
 
     Closes on Esc, the ✕ button, or when it loses focus (except while in edit
-    mode, so it can stay open as the 완료 button while the overlay is dragged).
+    mode, so it can stay open as the Done button while the overlay is dragged).
     """
 
     def __init__(self, overlay):
         self.o = o = overlay
-        s = o.s
+        s, t = o.s, o.t
         self.win = win = tk.Toplevel(o.root)
         win.withdraw()  # stay hidden until placed
         win.overrideredirect(True)
@@ -282,25 +339,23 @@ class SettingsPopup:
         close.bind("<Enter>", lambda e: close.configure(fg=FG))
         close.bind("<Leave>", lambda e: close.configure(fg=DIM))
 
-        self.show_toggle = self._toggle_row(body, "오버레이 표시", "끄면 다시 켤 때까지 숨김",
+        self.show_toggle = self._toggle_row(body, t("show"), t("show_sub"),
                                             o.visible, o.set_visible)
-        self.game_toggle = self._toggle_row(body, "게임 모드",
-                                            "RAM · GPU · 네트워크만 한 줄로 표시",
+        self.game_toggle = self._toggle_row(body, t("game"), t("game_sub"),
                                             o.cfg["game_mode"], o.set_game_mode)
 
-        self._section(body, "위치")
-        row = tk.Frame(body, bg=PANEL)
+        self._section(body, t("position"))
+        self.pos_row = row = tk.Frame(body, bg=PANEL)
         row.pack(fill="x")
         row.columnconfigure((0, 1), weight=1, uniform="b")
         self.edit_btn = self._button(row, "", o.toggle_edit)
         self.edit_btn.grid(row=0, column=0, sticky="ew", padx=(0, round(4 * s)))
-        self._button(row, "우측 상단으로", o.reset_position).grid(
+        self._button(row, t("top_right"), o.reset_position).grid(
             row=0, column=1, sticky="ew", padx=(round(4 * s), 0))
-        self.hint = tk.Label(body, text="", bg=PANEL, fg=DIM, font=("Segoe UI", 8),
+        self.hint = tk.Label(body, text=t("move_hint"), bg=PANEL, fg=DIM, font=("Segoe UI", 8),
                              anchor="w", justify="left", wraplength=round(255 * s))
-        self.hint.pack(fill="x", pady=(round(4 * s), 0))
 
-        alpha_head = self._section(body, "투명도")
+        alpha_head = self._section(body, t("opacity"))
         self.alpha_lbl = tk.Label(alpha_head, text="", bg=PANEL, fg=FG, font=("Consolas", 9))
         self.alpha_lbl.pack(side="right")
         self.slider = Slider(body, s, 30, 100, 5, round(o.cfg["alpha"] * 100), self._alpha)
@@ -309,14 +364,27 @@ class SettingsPopup:
 
         startup = tk.Frame(body, bg=PANEL)
         startup.pack(fill="x", pady=(round(14 * s), 0))
-        tk.Label(startup, text="Windows 시작 시 실행", bg=PANEL, fg=FG,
+        tk.Label(startup, text=t("startup"), bg=PANEL, fg=FG,
                  font=("Segoe UI", 9)).pack(side="left")
         Toggle(startup, s, o._startup_enabled(), o.set_startup).c.pack(side="right")
+
+        lang = tk.Frame(body, bg=PANEL)
+        lang.pack(fill="x", pady=(round(12 * s), 0))
+        tk.Label(lang, text=t("language"), bg=PANEL, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        seg = tk.Frame(lang, bg=PANEL)
+        seg.pack(side="right")
+        for code, name in LANGUAGES:
+            b = self._button(seg, name, lambda c=code: o.set_language(c), padx=round(8 * s))
+            if code == o.cfg["lang"]:
+                b.base = ACCENT
+                b.configure(bg=ACCENT, fg="#0b0d10")
+            b.pack(side="left", padx=(round(4 * s), 0))
 
         tk.Frame(body, bg="#2a2f36", height=1).pack(fill="x", pady=round(12 * s))
         foot = tk.Frame(body, bg=PANEL)
         foot.pack(fill="x")
-        self._button(foot, "종료", o.quit, padx=round(18 * s)).pack(side="right")
+        self._button(foot, t("quit"), o.quit, padx=round(18 * s)).pack(side="right")
 
         self.refresh()
         round_corners(ctypes.windll.user32.GetParent(win.winfo_id()))
@@ -362,10 +430,13 @@ class SettingsPopup:
         self.game_toggle.set(self.o.cfg["game_mode"])
         b = self.edit_btn
         b.base = ACCENT if self.o.editing else BTN
-        b.configure(text="완료" if self.o.editing else "위치 편집", bg=b.base,
+        b.configure(text=self.o.t("done" if self.o.editing else "move"), bg=b.base,
                     fg="#0b0d10" if self.o.editing else FG)
-        self.hint.configure(text="오버레이를 드래그해서 옮기세요. 더블클릭해도 완료됩니다."
-                            if self.o.editing else "")
+        # Only take up space while moving.
+        if self.o.editing:
+            self.hint.pack(fill="x", pady=(round(4 * self.o.s), 0), after=self.pos_row)
+        else:
+            self.hint.pack_forget()
         self._place()
 
     def _place(self):
@@ -404,12 +475,14 @@ class SettingsPopup:
 class Overlay:
     def __init__(self):
         self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"],
-                    "game_mode": False}
+                    "game_mode": False, "lang": default_language()}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 self.cfg.update(json.load(f))
         except (OSError, ValueError):
             pass
+        if self.cfg["lang"] not in STRINGS:
+            self.cfg["lang"] = "en"
 
         self.gpu = Gpu()
         self.net = Net()
@@ -450,6 +523,23 @@ class Overlay:
         self._build_tray()
         self._pump_calls()
         self._tick()
+
+    # ---- language --------------------------------------------------------
+
+    def t(self, key, **fmt):
+        return STRINGS[self.cfg["lang"]][key].format(**fmt)
+
+    def set_language(self, lang):
+        if lang == self.cfg["lang"]:
+            return
+        self.cfg["lang"] = lang
+        self._save()
+        if self.visible:
+            self._update()
+        self.tray.update_menu()
+        if self.popup:  # rebuild it in the new language
+            self.popup.close()
+            self.popup = SettingsPopup(self)
 
     # ---- layout ----------------------------------------------------------
 
@@ -634,19 +724,22 @@ class Overlay:
             # pystray callbacks run on its own thread; hand work to the Tk thread.
             return lambda icon, item: self.calls.put((fn, args))
 
+        def text(key):
+            return lambda item: self.t(key)  # re-read on update_menu()
+
         # The default item is what a left click on the tray icon triggers.
         menu = pystray.Menu(
-            pystray.MenuItem("설정", call(self.toggle_settings), default=True),
-            pystray.MenuItem("오버레이 표시", lambda icon, item: self.calls.put(
+            pystray.MenuItem(text("settings"), call(self.toggle_settings), default=True),
+            pystray.MenuItem(text("show"), lambda icon, item: self.calls.put(
                 (self.set_visible, (not self.visible,))),
                 checked=lambda item: self.visible),
-            pystray.MenuItem("게임 모드", lambda icon, item: self.calls.put(
+            pystray.MenuItem(text("game"), lambda icon, item: self.calls.put(
                 (self.set_game_mode, (not self.cfg["game_mode"],))),
                 checked=lambda item: self.cfg["game_mode"]),
-            pystray.MenuItem("위치 편집 모드", call(self.toggle_edit),
+            pystray.MenuItem(text("move_mode"), call(self.toggle_edit),
                              checked=lambda item: self.editing),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("종료", call(self.quit)),
+            pystray.MenuItem(text("quit"), call(self.quit)),
         )
         self.tray = pystray.Icon("PerfOverlay", tray_image(self.cfg["game_mode"]),
                                  "Perf Overlay", menu)
@@ -745,7 +838,7 @@ class Overlay:
         c.itemconfigure(k["down"], text=fmt_rate_short(down))
         c.itemconfigure(k["up"], text=fmt_rate_short(up))
 
-        self.tray.title = (f"[게임 모드] RAM {vm.percent:.0f}% · GPU {gpu_txt} · "
+        self.tray.title = (f"{self.t('game_tip')} RAM {vm.percent:.0f}% · GPU {gpu_txt} · "
                            f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)}")
 
     def _tick(self):
@@ -753,7 +846,7 @@ class Overlay:
             self._update()
             self._keep_topmost()
         else:
-            self.tray.title = "Perf Overlay (숨김)"  # nothing measured while hidden
+            self.tray.title = self.t("hidden_tip")  # nothing measured while hidden
         self.root.after(INTERVAL_MS, self._tick)
 
     def _keep_topmost(self):
@@ -774,7 +867,7 @@ class Overlay:
             return
         per = psutil.cpu_percent(None, percpu=True)
         cpu = sum(per) / len(per)
-        self._set_row("CPU", cpu, f"{len(per)} threads")
+        self._set_row("CPU", cpu, self.t("threads", n=len(per)))
         for (cb, cx0, cx1, top, bottom), pct in zip(self.cores, per):
             self.canvas.coords(cb, cx0, bottom - (bottom - top) * pct / 100, cx1, bottom)
             self.canvas.itemconfigure(cb, fill=load_color(pct))
@@ -807,8 +900,9 @@ class Overlay:
             except OSError:
                 self._set_row(name, None)
                 continue
-            self._set_row(name, u.percent, f"{u.percent:.0f}% of {fmt_size(u.total)}",
-                          f"{fmt_size(u.free)} free")
+            self._set_row(name, u.percent,
+                          self.t("disk_used", pct=f"{u.percent:.0f}", total=fmt_size(u.total)),
+                          self.t("disk_free", free=fmt_size(u.free)))
 
         self.tray.title = f"CPU {cpu:.0f}% · RAM {vm.percent:.0f}% · GPU {gpu_txt}"
 
