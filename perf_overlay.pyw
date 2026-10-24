@@ -1,10 +1,12 @@
-"""Tiny always-on-top overlay showing CPU / RAM / GPU usage.
+"""Tiny always-on-top overlay showing CPU / RAM / GPU usage, network
+throughput and free disk space.
 
 - The overlay ignores the mouse (clicks pass through to whatever is below).
 - Everything is controlled from the tray icon (taskbar, bottom-right):
   edit mode (drag to move), reset position, opacity, run at startup, exit.
   Double-clicking the tray icon toggles edit mode.
-- Settings live in perf_overlay.json next to this script.
+- Settings live in perf_overlay.json next to this script ("drives" picks
+  which drives to show).
 
 Requires: psutil, pystray, pillow. GPU stats use nvml.dll, which ships with
 the NVIDIA driver.
@@ -14,6 +16,7 @@ import json
 import os
 import queue
 import sys
+import time
 import tkinter as tk
 import winreg
 
@@ -80,6 +83,50 @@ class Gpu:
         return util.gpu, mem.used / 2**30, mem.total / 2**30
 
 
+class Net:
+    """Throughput of the busiest active adapter (e.g. 이더넷), loopback excluded."""
+
+    def __init__(self):
+        self.nic = None
+        self.speed = 0  # link speed, Mbps
+        self.last = None
+
+    def _pick(self):
+        stats = psutil.net_if_stats()
+        io = psutil.net_io_counters(pernic=True)
+        live = [n for n, s in stats.items()
+                if s.isup and s.speed > 0 and n in io and "loopback" not in n.lower()]
+        nic = max(live, key=lambda n: io[n].bytes_recv + io[n].bytes_sent, default=None)
+        self.nic, self.speed, self.last = nic, stats[nic].speed if nic else 0, None
+
+    def read(self):
+        """Returns (down B/s, up B/s, link Mbps), or None if no adapter is up."""
+        io = psutil.net_io_counters(pernic=True)
+        if self.nic not in io:
+            self._pick()
+            if self.nic is None:
+                return None
+        c, now = io[self.nic], time.monotonic()
+        prev, self.last = self.last, (c.bytes_recv, c.bytes_sent, now)
+        if prev is None:
+            return 0.0, 0.0, self.speed
+        dt = max(now - prev[2], 1e-6)
+        return (c.bytes_recv - prev[0]) / dt, (c.bytes_sent - prev[1]) / dt, self.speed
+
+
+def fmt_rate(bps):
+    for unit in ("B/s", "KB/s", "MB/s"):
+        if bps < 1024:
+            return f"{bps:.0f} {unit}" if unit == "B/s" else f"{bps:.1f} {unit}"
+        bps /= 1024
+    return f"{bps:.1f} GB/s"
+
+
+def fmt_size(nbytes):
+    gb = nbytes / 2**30
+    return f"{gb / 1024:.1f} TB" if gb >= 1000 else f"{gb:.0f} GB"
+
+
 def work_area():
     """Primary monitor's work area (excludes the taskbar) as (left, top, right, bottom)."""
     class RECT(ctypes.Structure):
@@ -110,7 +157,7 @@ def tray_image():
 
 class Overlay:
     def __init__(self):
-        self.cfg = {"x": None, "y": None, "alpha": 0.85}
+        self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"]}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 self.cfg.update(json.load(f))
@@ -118,6 +165,8 @@ class Overlay:
             pass
 
         self.gpu = Gpu()
+        self.net = Net()
+        self.drives = [d for d in self.cfg["drives"] if os.path.exists(d)]
         psutil.cpu_percent(None, percpu=True)  # first call always returns 0; prime it
         self.editing = False
         self.calls = queue.Queue()  # tray thread -> Tk thread
@@ -131,7 +180,7 @@ class Overlay:
         s = root.winfo_fpixels("1i") / 96  # DPI scale factor
         self.s = s
         self.w, self.row_h, self.pad = round(230 * s), round(30 * s), round(10 * s)
-        rows = ["CPU", "RAM", "GPU"]
+        rows = ["CPU", "RAM", "GPU", "NET"] + [d.rstrip("\\") for d in self.drives]
         self.ncpu = psutil.cpu_count() or 1
         core_h, core_gap = round(18 * s), round(4 * s)
         strip_h = round(4 * s) + core_h + core_gap  # per-thread strip under the CPU row
@@ -157,7 +206,7 @@ class Overlay:
             value = c.create_text(x1, ty, text="--", fill=FG, font=value_font, anchor="e")
             c.create_rectangle(x0, by0, x1, by1, fill=TRACK, width=0)
             bar = c.create_rectangle(x0, by0, x0, by1, fill=load_color(0), width=0)
-            self.items[name] = (detail, value, bar, x0, x1, by0, by1)
+            self.items[name] = (detail, value, bar, x0, x1, by0, by1, ty)
             if name == "CPU":
                 top = by1 + round(4 * s)
                 bottom = top + core_h
@@ -320,19 +369,21 @@ class Overlay:
 
     # ---- update loop -----------------------------------------------------
 
-    def _set_row(self, name, pct, detail=""):
-        d, v, bar, x0, x1, by0, by1 = self.items[name]
+    def _set_row(self, name, pct, detail="", value=None):
+        """pct drives the bar; value replaces the default "NN%" text on the right."""
+        d, v, bar, x0, x1, by0, by1, ty = self.items[name]
         c = self.canvas
         if pct is None:
             c.itemconfigure(v, text="N/A", fill=DIM)
-            c.itemconfigure(d, text=detail)
             c.coords(bar, x0, by0, x0, by1)
-            return
-        pct = max(0.0, min(100.0, pct))
-        c.itemconfigure(v, text=f"{pct:3.0f}%", fill=FG)
+        else:
+            pct = max(0.0, min(100.0, pct))
+            c.itemconfigure(v, text=value or f"{pct:3.0f}%", fill=FG)
+            c.coords(bar, x0, by0, x0 + (x1 - x0) * pct / 100, by1)
+            c.itemconfigure(bar, fill=load_color(pct))
         c.itemconfigure(d, text=detail)
-        c.coords(bar, x0, by0, x0 + (x1 - x0) * pct / 100, by1)
-        c.itemconfigure(bar, fill=load_color(pct))
+        # Keep the detail text just left of the value, whose width varies.
+        c.coords(d, c.bbox(v)[0] - round(8 * self.s), ty)
 
     def _tick(self):
         per = psutil.cpu_percent(None, percpu=True)
@@ -354,6 +405,24 @@ class Overlay:
             util, used, total = g
             self._set_row("GPU", util, f"VRAM {used:.1f} / {total:.0f} GB")
             gpu_txt = f"{util}%"
+
+        net = self.net.read()
+        if net is None:
+            self._set_row("NET", None)
+        else:
+            down, up, mbps = net
+            pct = max(down, up) * 8 / (mbps * 1e6) * 100 if mbps else 0
+            self._set_row("NET", pct, f"↑ {fmt_rate(up)}", f"↓ {fmt_rate(down)}")
+
+        for drive in self.drives:
+            name = drive.rstrip("\\")
+            try:
+                u = psutil.disk_usage(drive)
+            except OSError:
+                self._set_row(name, None)
+                continue
+            self._set_row(name, u.percent, f"{u.percent:.0f}% of {fmt_size(u.total)}",
+                          f"{fmt_size(u.free)} free")
 
         self.tray.title = f"CPU {cpu:.0f}% · RAM {vm.percent:.0f}% · GPU {gpu_txt}"
         self.root.attributes("-topmost", True)  # re-assert in case another window took it
