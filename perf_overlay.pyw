@@ -2,9 +2,9 @@
 throughput and free disk space.
 
 - The overlay ignores the mouse (clicks pass through to whatever is below).
-- Everything is controlled from the tray icon (taskbar, bottom-right):
+- Clicking the tray icon (taskbar, bottom-right) opens a settings popup:
   edit mode (drag to move), reset position, opacity, run at startup, exit.
-  Double-clicking the tray icon toggles edit mode.
+  In edit mode, double-click the overlay (or press 완료 in the popup) to finish.
 - Settings live in perf_overlay.json next to this script ("drives" picks
   which drives to show).
 
@@ -35,6 +35,10 @@ FG = "#e8e8e8"
 DIM = "#8a9099"
 TRACK = "#262b32"
 ACCENT = "#4da3ff"
+ACCENT_HOVER = "#6ab4ff"
+PANEL = "#1b1f25"
+BTN = "#2a3038"
+BTN_HOVER = "#353c46"
 
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
@@ -155,6 +159,203 @@ def tray_image():
     return img
 
 
+def round_corners(hwnd):
+    try:  # Windows 11: DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
+        pref = ctypes.c_int(2)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), 4)
+    except Exception:
+        pass
+
+
+class Slider:
+    """Flat horizontal slider drawn on a canvas; snaps to `step`."""
+
+    def __init__(self, parent, s, lo, hi, step, value, on_change):
+        self.lo, self.hi, self.step, self.value, self.on_change = lo, hi, step, value, on_change
+        self.h, self.r = round(20 * s), round(7 * s)
+        self.c = tk.Canvas(parent, height=self.h, bg=PANEL, highlightthickness=0, bd=0,
+                           cursor="hand2")
+        self.c.bind("<Configure>", lambda e: self._draw())
+        self.c.bind("<Button-1>", self._drag)
+        self.c.bind("<B1-Motion>", self._drag)
+
+    def _draw(self):
+        c, r, y = self.c, self.r, self.h / 2
+        w = c.winfo_width()
+        x = r + (w - 2 * r) * (self.value - self.lo) / (self.hi - self.lo)
+        c.delete("all")
+        c.create_line(r, y, w - r, y, fill=TRACK, width=r * 0.6, capstyle="round")
+        c.create_line(r, y, x, y, fill=ACCENT, width=r * 0.6, capstyle="round")
+        c.create_oval(x - r, y - r, x + r, y + r, fill=FG, outline="")
+
+    def _drag(self, e):
+        w, r = self.c.winfo_width(), self.r
+        f = min(1.0, max(0.0, (e.x - r) / max(1, w - 2 * r)))
+        v = round((self.lo + f * (self.hi - self.lo)) / self.step) * self.step
+        if v != self.value:
+            self.value = v
+            self._draw()
+            self.on_change(v)
+
+
+class Toggle:
+    """Windows-style on/off switch drawn on a canvas."""
+
+    def __init__(self, parent, s, value, on_change):
+        self.value, self.on_change = value, on_change
+        self.w, self.h = round(40 * s), round(20 * s)
+        self.c = tk.Canvas(parent, width=self.w, height=self.h, bg=PANEL,
+                           highlightthickness=0, bd=0, cursor="hand2")
+        self.c.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _draw(self):
+        c, w, h = self.c, self.w, self.h
+        r = h / 2
+        col = ACCENT if self.value else TRACK
+        c.delete("all")
+        c.create_oval(0, 0, h, h, fill=col, outline="")
+        c.create_oval(w - h, 0, w, h, fill=col, outline="")
+        c.create_rectangle(r, 0, w - r, h, fill=col, outline="")
+        kx, kr = (w - r if self.value else r), r - 4
+        c.create_oval(kx - kr, r - kr, kx + kr, r + kr, fill=FG if self.value else DIM,
+                      outline="")
+
+    def _click(self, e):
+        self.value = not self.value
+        self._draw()
+        self.on_change(self.value)
+
+
+class SettingsPopup:
+    """Flyout-style settings window shown above the tray, like Windows' own flyouts.
+
+    Closes on Esc, the ✕ button, or when it loses focus (except while in edit
+    mode, so it can stay open as the 완료 button while the overlay is dragged).
+    """
+
+    def __init__(self, overlay):
+        self.o = o = overlay
+        s = o.s
+        self.win = win = tk.Toplevel(o.root)
+        win.withdraw()  # stay hidden until placed
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=PANEL, highlightthickness=1, highlightbackground="#323843")
+
+        pad = round(16 * s)
+        body = tk.Frame(win, bg=PANEL, padx=pad, pady=round(12 * s))
+        body.pack(fill="both", expand=True)
+
+        head = tk.Frame(body, bg=PANEL)
+        head.pack(fill="x")
+        tk.Label(head, text="Perf Overlay", bg=PANEL, fg=FG,
+                 font=("Segoe UI Semibold", 11)).pack(side="left")
+        close = tk.Label(head, text="✕", bg=PANEL, fg=DIM, font=("Segoe UI", 10),
+                         cursor="hand2")
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: self.close())
+        close.bind("<Enter>", lambda e: close.configure(fg=FG))
+        close.bind("<Leave>", lambda e: close.configure(fg=DIM))
+
+        self._section(body, "위치")
+        row = tk.Frame(body, bg=PANEL)
+        row.pack(fill="x")
+        row.columnconfigure((0, 1), weight=1, uniform="b")
+        self.edit_btn = self._button(row, "", o.toggle_edit)
+        self.edit_btn.grid(row=0, column=0, sticky="ew", padx=(0, round(4 * s)))
+        self._button(row, "우측 상단으로", o.reset_position).grid(
+            row=0, column=1, sticky="ew", padx=(round(4 * s), 0))
+        self.hint = tk.Label(body, text="", bg=PANEL, fg=DIM, font=("Segoe UI", 8),
+                             anchor="w", justify="left", wraplength=round(255 * s))
+        self.hint.pack(fill="x", pady=(round(4 * s), 0))
+
+        alpha_head = self._section(body, "투명도")
+        self.alpha_lbl = tk.Label(alpha_head, text="", bg=PANEL, fg=FG, font=("Consolas", 9))
+        self.alpha_lbl.pack(side="right")
+        self.slider = Slider(body, s, 30, 100, 5, round(o.cfg["alpha"] * 100), self._alpha)
+        self.slider.c.pack(fill="x")
+        self._alpha_text()
+
+        startup = tk.Frame(body, bg=PANEL)
+        startup.pack(fill="x", pady=(round(14 * s), 0))
+        tk.Label(startup, text="Windows 시작 시 실행", bg=PANEL, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        Toggle(startup, s, o._startup_enabled(), o.set_startup).c.pack(side="right")
+
+        tk.Frame(body, bg="#2a2f36", height=1).pack(fill="x", pady=round(12 * s))
+        foot = tk.Frame(body, bg=PANEL)
+        foot.pack(fill="x")
+        self._button(foot, "종료", o.quit, padx=round(18 * s)).pack(side="right")
+
+        self.refresh()
+        round_corners(ctypes.windll.user32.GetParent(win.winfo_id()))
+
+        win.bind("<Escape>", lambda e: self.close())
+        win.bind("<FocusOut>", lambda e: win.after(80, self._close_if_unfocused))
+        win.deiconify()
+        win.lift()
+        win.focus_force()
+
+    def _section(self, parent, text):
+        f = tk.Frame(parent, bg=PANEL)
+        f.pack(fill="x", pady=(round(14 * self.o.s), round(6 * self.o.s)))
+        tk.Label(f, text=text, bg=PANEL, fg=DIM, font=("Segoe UI", 8)).pack(side="left")
+        return f
+
+    def _button(self, parent, text, command, padx=None):
+        s = self.o.s
+        b = tk.Label(parent, text=text, bg=BTN, fg=FG, font=("Segoe UI", 9), cursor="hand2",
+                     padx=padx or round(10 * s), pady=round(5 * s))
+        b.base = BTN
+        b.bind("<Button-1>", lambda e: command())
+        b.bind("<Enter>", lambda e: b.configure(bg=ACCENT_HOVER if b.base == ACCENT else BTN_HOVER))
+        b.bind("<Leave>", lambda e: b.configure(bg=b.base))
+        return b
+
+    def refresh(self):
+        """Sync the edit button with the overlay's edit mode."""
+        b = self.edit_btn
+        b.base = ACCENT if self.o.editing else BTN
+        b.configure(text="완료" if self.o.editing else "위치 편집", bg=b.base,
+                    fg="#0b0d10" if self.o.editing else FG)
+        self.hint.configure(text="오버레이를 드래그해서 옮기세요. 더블클릭해도 완료됩니다."
+                            if self.o.editing else "")
+        self._place()
+
+    def _place(self):
+        """Anchor the bottom-right corner just above the taskbar; height follows content."""
+        s, win = self.o.s, self.win
+        win.update_idletasks()
+        w, h = round(290 * s), win.winfo_reqheight()
+        l, t, r, b = work_area()
+        m = round(12 * s)
+        win.geometry(f"{w}x{h}+{r - w - m}+{b - h - m}")
+
+    def _alpha(self, pct):
+        self.o.set_alpha(pct / 100)
+        self._alpha_text()
+
+    def _alpha_text(self):
+        self.alpha_lbl.configure(text=f"{self.slider.value}%")
+
+    def _close_if_unfocused(self):
+        if self.o.editing or not self.win.winfo_exists():
+            return
+        try:
+            focused = self.win.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
+        if focused is None or focused.winfo_toplevel() is not self.win:
+            self.close()
+
+    def close(self):
+        if self.win.winfo_exists():
+            self.win.destroy()
+        self.o.popup = None
+        self.o.popup_closed_at = time.monotonic()
+
+
 class Overlay:
     def __init__(self):
         self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"]}
@@ -169,6 +370,8 @@ class Overlay:
         self.drives = [d for d in self.cfg["drives"] if os.path.exists(d)]
         psutil.cpu_percent(None, percpu=True)  # first call always returns 0; prime it
         self.editing = False
+        self.popup = None
+        self.popup_closed_at = 0.0
         self.calls = queue.Queue()  # tray thread -> Tk thread
 
         self.root = root = tk.Tk()
@@ -227,13 +430,14 @@ class Overlay:
         self._place_initial()
         root.update_idletasks()
         self.hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        self._round_corners()
+        round_corners(self.hwnd)
         self._apply_click_through()
 
-        for w in (root, c):
-            w.bind("<ButtonPress-1>", self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
-            w.bind("<ButtonRelease-1>", lambda e: self._save())
+        # Bound on the toplevel only: its bindtag also covers the canvas.
+        root.bind("<ButtonPress-1>", self._drag_start)
+        root.bind("<B1-Motion>", self._drag_move)
+        root.bind("<ButtonRelease-1>", lambda e: self._save())
+        root.bind("<Double-Button-1>", lambda e: self.editing and self.toggle_edit())
 
         self._build_tray()
         self._pump_calls()
@@ -260,13 +464,6 @@ class Overlay:
         self.root.geometry(f"+{x}+{y}")
         self._save()
 
-    def _round_corners(self):
-        try:  # Windows 11: DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
-            pref = ctypes.c_int(2)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(self.hwnd, 33, ctypes.byref(pref), 4)
-        except Exception:
-            pass
-
     # ---- click-through / edit mode ---------------------------------------
 
     def _apply_click_through(self):
@@ -286,6 +483,9 @@ class Overlay:
         self._apply_click_through()
         if not self.editing:
             self._save()
+        if self.popup:
+            self.popup.refresh()
+        self.tray.update_menu()
 
     def _drag_start(self, e):
         self._dx = e.x_root - self.root.winfo_x()
@@ -302,22 +502,24 @@ class Overlay:
             # pystray callbacks run on its own thread; hand work to the Tk thread.
             return lambda icon, item: self.calls.put((fn, args))
 
-        def alpha_item(a):
-            return pystray.MenuItem(f"{int(a * 100)}%", call(self.set_alpha, a), radio=True,
-                                    checked=lambda item: abs(self.cfg["alpha"] - a) < 1e-6)
-
+        # The default item is what a left click on the tray icon triggers.
         menu = pystray.Menu(
-            pystray.MenuItem("위치 편집 모드", call(self.toggle_edit), default=True,
+            pystray.MenuItem("설정", call(self.toggle_settings), default=True),
+            pystray.MenuItem("위치 편집 모드", call(self.toggle_edit),
                              checked=lambda item: self.editing),
-            pystray.MenuItem("우측 상단으로 이동", call(self.reset_position)),
-            pystray.MenuItem("투명도", pystray.Menu(*(alpha_item(a) for a in (1.0, 0.85, 0.7, 0.5)))),
-            pystray.MenuItem("Windows 시작 시 실행", call(self.toggle_startup),
-                             checked=lambda item: self._startup_enabled()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", call(self.quit)),
         )
         self.tray = pystray.Icon("PerfOverlay", tray_image(), "Perf Overlay", menu)
         self.tray.run_detached()
+
+    def toggle_settings(self):
+        if self.popup:
+            self.popup.close()
+        # Clicking the tray icon steals focus first, which already closed the
+        # popup; don't reopen it from that same click.
+        elif time.monotonic() - self.popup_closed_at > 0.4:
+            self.popup = SettingsPopup(self)
 
     def _pump_calls(self):
         while not self.calls.empty():
@@ -346,14 +548,12 @@ class Overlay:
         except OSError:
             return False
 
-    def toggle_startup(self):
-        enable = not self._startup_enabled()
+    def set_startup(self, enable):
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
             if enable:
                 winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, self._startup_command())
-            else:
+            elif self._startup_enabled():
                 winreg.DeleteValue(k, RUN_NAME)
-        self.tray.update_menu()
 
     def quit(self):
         self.tray.stop()
