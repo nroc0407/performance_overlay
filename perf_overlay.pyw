@@ -3,7 +3,8 @@ throughput and free disk space.
 
 - The overlay ignores the mouse (clicks pass through to whatever is below).
 - Clicking the tray icon (taskbar, bottom-right) opens a settings popup:
-  edit mode (drag to move), reset position, opacity, run at startup, exit.
+  game mode (RAM / GPU / NET only), edit mode (drag to move), reset position,
+  opacity, run at startup, exit. Right-click the icon for quick toggles.
   In edit mode, double-click the overlay (or press 완료 in the popup) to finish.
 - Settings live in perf_overlay.json next to this script ("drives" picks
   which drives to show).
@@ -148,12 +149,13 @@ def virtual_screen():
     return x, y, x + gsm(78), y + gsm(79)
 
 
-def tray_image():
-    """64x64 icon: three bars of rising height."""
+def tray_image(game_mode=False):
+    """64x64 icon: three bars of rising height, all blue in game mode."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((0, 0, 63, 63), radius=12, fill=BG)
-    for i, (h, color) in enumerate([(22, "#4cd964"), (34, "#ffb84d"), (46, "#ff5c5c")]):
+    colors = [ACCENT] * 3 if game_mode else ["#4cd964", "#ffb84d", "#ff5c5c"]
+    for i, (h, color) in enumerate(zip((22, 34, 46), colors)):
         x = 10 + i * 16
         d.rectangle((x, 54 - h, x + 11, 54), fill=color)
     return img
@@ -226,6 +228,11 @@ class Toggle:
         self._draw()
         self.on_change(self.value)
 
+    def set(self, value):
+        if value != self.value:
+            self.value = value
+            self._draw()
+
 
 class SettingsPopup:
     """Flyout-style settings window shown above the tray, like Windows' own flyouts.
@@ -257,6 +264,17 @@ class SettingsPopup:
         close.bind("<Button-1>", lambda e: self.close())
         close.bind("<Enter>", lambda e: close.configure(fg=FG))
         close.bind("<Leave>", lambda e: close.configure(fg=DIM))
+
+        game = tk.Frame(body, bg=PANEL)
+        game.pack(fill="x", pady=(round(14 * s), 0))
+        text = tk.Frame(game, bg=PANEL)
+        text.pack(side="left")
+        tk.Label(text, text="게임 모드", bg=PANEL, fg=FG,
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w")
+        tk.Label(text, text="RAM · GPU · 네트워크만 표시", bg=PANEL, fg=DIM,
+                 font=("Segoe UI", 8)).pack(anchor="w")
+        self.game_toggle = Toggle(game, s, o.cfg["game_mode"], o.set_game_mode)
+        self.game_toggle.c.pack(side="right")
 
         self._section(body, "위치")
         row = tk.Frame(body, bg=PANEL)
@@ -314,7 +332,8 @@ class SettingsPopup:
         return b
 
     def refresh(self):
-        """Sync the edit button with the overlay's edit mode."""
+        """Sync the controls with state that may also change from the tray menu."""
+        self.game_toggle.set(self.o.cfg["game_mode"])
         b = self.edit_btn
         b.base = ACCENT if self.o.editing else BTN
         b.configure(text="완료" if self.o.editing else "위치 편집", bg=b.base,
@@ -358,7 +377,8 @@ class SettingsPopup:
 
 class Overlay:
     def __init__(self):
-        self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"]}
+        self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"],
+                    "game_mode": False}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 self.cfg.update(json.load(f))
@@ -383,15 +403,45 @@ class Overlay:
         s = root.winfo_fpixels("1i") / 96  # DPI scale factor
         self.s = s
         self.w, self.row_h, self.pad = round(230 * s), round(30 * s), round(10 * s)
-        rows = ["CPU", "RAM", "GPU", "NET"] + [d.rstrip("\\") for d in self.drives]
         self.ncpu = psutil.cpu_count() or 1
+        self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
+        self.canvas.pack()
+        self._build_rows()
+
+        self._place_initial()
+        root.update_idletasks()
+        self.hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        round_corners(self.hwnd)
+        self._apply_click_through()
+
+        # Bound on the toplevel only: its bindtag also covers the canvas.
+        root.bind("<ButtonPress-1>", self._drag_start)
+        root.bind("<B1-Motion>", self._drag_move)
+        root.bind("<ButtonRelease-1>", lambda e: self._save())
+        root.bind("<Double-Button-1>", lambda e: self.editing and self.toggle_edit())
+
+        self._build_tray()
+        self._pump_calls()
+        self._tick()
+
+    # ---- layout ----------------------------------------------------------
+
+    def _rows(self):
+        if self.cfg["game_mode"]:
+            return ["RAM", "GPU", "NET"]
+        return ["CPU", "RAM", "GPU", "NET"] + [d.rstrip("\\") for d in self.drives]
+
+    def _build_rows(self):
+        """(Re)draw the rows for the current mode and resize the window to fit."""
+        s, c = self.s, self.canvas
+        rows = self._rows()
         core_h, core_gap = round(18 * s), round(4 * s)
-        strip_h = round(4 * s) + core_h + core_gap  # per-thread strip under the CPU row
+        # Per-thread strip under the CPU row.
+        strip_h = round(4 * s) + core_h + core_gap if "CPU" in rows else 0
         self.h = self.pad * 2 + self.row_h * len(rows) - round(6 * s) + strip_h
 
-        self.canvas = c = tk.Canvas(root, width=self.w, height=self.h, bg=BG,
-                                    highlightthickness=0, bd=0)
-        c.pack()
+        c.delete("all")
+        c.configure(width=self.w, height=self.h)
         label_font = ("Segoe UI Semibold", 9)
         detail_font = ("Segoe UI", 8)
         value_font = ("Consolas", 10, "bold")
@@ -424,24 +474,20 @@ class Overlay:
                 offset = strip_h
         bw = max(3, round(3 * s))
         self.edit_border = c.create_rectangle(bw // 2, bw // 2, self.w - bw // 2 - 1,
-                                              self.h - bw // 2 - 1, outline=ACCENT,
-                                              width=bw, state="hidden")
+                                              self.h - bw // 2 - 1, outline=ACCENT, width=bw,
+                                              state="normal" if self.editing else "hidden")
+        self.root.geometry(f"{self.w}x{self.h}")  # keeps the current position
 
-        self._place_initial()
-        root.update_idletasks()
-        self.hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        round_corners(self.hwnd)
-        self._apply_click_through()
-
-        # Bound on the toplevel only: its bindtag also covers the canvas.
-        root.bind("<ButtonPress-1>", self._drag_start)
-        root.bind("<B1-Motion>", self._drag_move)
-        root.bind("<ButtonRelease-1>", lambda e: self._save())
-        root.bind("<Double-Button-1>", lambda e: self.editing and self.toggle_edit())
-
-        self._build_tray()
-        self._pump_calls()
-        self._tick()
+    def set_game_mode(self, on):
+        """Game mode shows only RAM / GPU / NET."""
+        self.cfg["game_mode"] = on
+        self._build_rows()
+        self._update()
+        self._save()
+        self.tray.icon = tray_image(on)
+        self.tray.update_menu()
+        if self.popup:
+            self.popup.refresh()
 
     # ---- placement -------------------------------------------------------
 
@@ -505,12 +551,16 @@ class Overlay:
         # The default item is what a left click on the tray icon triggers.
         menu = pystray.Menu(
             pystray.MenuItem("설정", call(self.toggle_settings), default=True),
+            pystray.MenuItem("게임 모드", lambda icon, item: self.calls.put(
+                (self.set_game_mode, (not self.cfg["game_mode"],))),
+                checked=lambda item: self.cfg["game_mode"]),
             pystray.MenuItem("위치 편집 모드", call(self.toggle_edit),
                              checked=lambda item: self.editing),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", call(self.quit)),
         )
-        self.tray = pystray.Icon("PerfOverlay", tray_image(), "Perf Overlay", menu)
+        self.tray = pystray.Icon("PerfOverlay", tray_image(self.cfg["game_mode"]),
+                                 "Perf Overlay", menu)
         self.tray.run_detached()
 
     def toggle_settings(self):
@@ -586,12 +636,21 @@ class Overlay:
         c.coords(d, c.bbox(v)[0] - round(8 * self.s), ty)
 
     def _tick(self):
-        per = psutil.cpu_percent(None, percpu=True)
-        cpu = sum(per) / len(per)
-        self._set_row("CPU", cpu, f"{len(per)} threads")
-        for (cb, cx0, cx1, top, bottom), pct in zip(self.cores, per):
-            self.canvas.coords(cb, cx0, bottom - (bottom - top) * pct / 100, cx1, bottom)
-            self.canvas.itemconfigure(cb, fill=load_color(pct))
+        self._update()
+        self.root.attributes("-topmost", True)  # re-assert in case another window took it
+        self.root.after(INTERVAL_MS, self._tick)
+
+    def _update(self):
+        """Refresh the rows currently shown; hidden rows aren't measured at all."""
+        tip = []
+        if "CPU" in self.items:
+            per = psutil.cpu_percent(None, percpu=True)
+            cpu = sum(per) / len(per)
+            self._set_row("CPU", cpu, f"{len(per)} threads")
+            for (cb, cx0, cx1, top, bottom), pct in zip(self.cores, per):
+                self.canvas.coords(cb, cx0, bottom - (bottom - top) * pct / 100, cx1, bottom)
+                self.canvas.itemconfigure(cb, fill=load_color(pct))
+            tip.append(f"CPU {cpu:.0f}%")
 
         vm = psutil.virtual_memory()
         self._set_row("RAM", vm.percent,
@@ -616,6 +675,8 @@ class Overlay:
 
         for drive in self.drives:
             name = drive.rstrip("\\")
+            if name not in self.items:
+                continue
             try:
                 u = psutil.disk_usage(drive)
             except OSError:
@@ -624,9 +685,9 @@ class Overlay:
             self._set_row(name, u.percent, f"{u.percent:.0f}% of {fmt_size(u.total)}",
                           f"{fmt_size(u.free)} free")
 
-        self.tray.title = f"CPU {cpu:.0f}% · RAM {vm.percent:.0f}% · GPU {gpu_txt}"
-        self.root.attributes("-topmost", True)  # re-assert in case another window took it
-        self.root.after(INTERVAL_MS, self._tick)
+        tip += [f"RAM {vm.percent:.0f}%", f"GPU {gpu_txt}"]
+        prefix = "[게임 모드] " if self.cfg["game_mode"] else ""
+        self.tray.title = prefix + " · ".join(tip)
 
     def run(self):
         self.root.mainloop()
