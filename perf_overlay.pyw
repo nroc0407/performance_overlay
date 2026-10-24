@@ -3,7 +3,7 @@ throughput and free disk space.
 
 - The overlay ignores the mouse (clicks pass through to whatever is below).
 - Clicking the tray icon (taskbar, bottom-right) opens a settings popup:
-  game mode (RAM / GPU / NET only), edit mode (drag to move), reset position,
+  show/hide the overlay for a while, game mode (RAM / GPU / NET only), edit mode (drag to move), reset position,
   opacity, run at startup, exit. Right-click the icon for quick toggles.
   In edit mode, double-click the overlay (or press 완료 in the popup) to finish.
 - Settings live in perf_overlay.json next to this script ("drives" picks
@@ -161,12 +161,17 @@ def virtual_screen():
     return x, y, x + gsm(78), y + gsm(79)
 
 
-def tray_image(game_mode=False):
-    """64x64 icon: three bars of rising height, all blue in game mode."""
+def tray_image(game_mode=False, hidden=False):
+    """64x64 icon: three bars of rising height, blue in game mode, grey when hidden."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((0, 0, 63, 63), radius=12, fill=BG)
-    colors = [ACCENT] * 3 if game_mode else ["#4cd964", "#ffb84d", "#ff5c5c"]
+    if hidden:
+        colors = [DIM] * 3
+    elif game_mode:
+        colors = [ACCENT] * 3
+    else:
+        colors = ["#4cd964", "#ffb84d", "#ff5c5c"]
     for i, (h, color) in enumerate(zip((22, 34, 46), colors)):
         x = 10 + i * 16
         d.rectangle((x, 54 - h, x + 11, 54), fill=color)
@@ -277,16 +282,11 @@ class SettingsPopup:
         close.bind("<Enter>", lambda e: close.configure(fg=FG))
         close.bind("<Leave>", lambda e: close.configure(fg=DIM))
 
-        game = tk.Frame(body, bg=PANEL)
-        game.pack(fill="x", pady=(round(14 * s), 0))
-        text = tk.Frame(game, bg=PANEL)
-        text.pack(side="left")
-        tk.Label(text, text="게임 모드", bg=PANEL, fg=FG,
-                 font=("Segoe UI Semibold", 10)).pack(anchor="w")
-        tk.Label(text, text="RAM · GPU · 네트워크만 한 줄로 표시", bg=PANEL, fg=DIM,
-                 font=("Segoe UI", 8)).pack(anchor="w")
-        self.game_toggle = Toggle(game, s, o.cfg["game_mode"], o.set_game_mode)
-        self.game_toggle.c.pack(side="right")
+        self.show_toggle = self._toggle_row(body, "오버레이 표시", "끄면 다시 켤 때까지 숨김",
+                                            o.visible, o.set_visible)
+        self.game_toggle = self._toggle_row(body, "게임 모드",
+                                            "RAM · GPU · 네트워크만 한 줄로 표시",
+                                            o.cfg["game_mode"], o.set_game_mode)
 
         self._section(body, "위치")
         row = tk.Frame(body, bg=PANEL)
@@ -327,6 +327,19 @@ class SettingsPopup:
         win.lift()
         win.focus_force()
 
+    def _toggle_row(self, parent, title, subtitle, value, on_change):
+        s = self.o.s
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(fill="x", pady=(round(14 * s), 0))
+        text = tk.Frame(row, bg=PANEL)
+        text.pack(side="left")
+        tk.Label(text, text=title, bg=PANEL, fg=FG,
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w")
+        tk.Label(text, text=subtitle, bg=PANEL, fg=DIM, font=("Segoe UI", 8)).pack(anchor="w")
+        toggle = Toggle(row, s, value, on_change)
+        toggle.c.pack(side="right")
+        return toggle
+
     def _section(self, parent, text):
         f = tk.Frame(parent, bg=PANEL)
         f.pack(fill="x", pady=(round(14 * self.o.s), round(6 * self.o.s)))
@@ -345,6 +358,7 @@ class SettingsPopup:
 
     def refresh(self):
         """Sync the controls with state that may also change from the tray menu."""
+        self.show_toggle.set(self.o.visible)
         self.game_toggle.set(self.o.cfg["game_mode"])
         b = self.edit_btn
         b.base = ACCENT if self.o.editing else BTN
@@ -402,6 +416,7 @@ class Overlay:
         self.drives = [d for d in self.cfg["drives"] if os.path.exists(d)]
         psutil.cpu_percent(None, percpu=True)  # first call always returns 0; prime it
         self.editing = False
+        self.visible = True  # deliberately not saved: hiding is only "for a while"
         self.popup = None
         self.popup_closed_at = 0.0
         self.calls = queue.Queue()  # tray thread -> Tk thread
@@ -536,7 +551,7 @@ class Overlay:
         self.root.update_idletasks()  # apply the move so _save() reads the new position
         self._update()
         self._save()
-        self.tray.icon = tray_image(on)
+        self.tray.icon = tray_image(on, not self.visible)
         self.tray.update_menu()
         if self.popup:
             self.popup.refresh()
@@ -576,7 +591,24 @@ class Overlay:
             style |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
         u.SetWindowLongW(self.hwnd, GWL_EXSTYLE, style)
 
+    def set_visible(self, on):
+        """Hide by fading to fully transparent: the window stays click-through and
+        never has to be re-shown (which could steal focus from the popup)."""
+        if not on and self.editing:
+            self.toggle_edit()
+        self.visible = on
+        self.root.attributes("-alpha", self.cfg["alpha"] if on else 0.0)
+        self._apply_click_through()
+        if on:
+            self._update()
+        self.tray.icon = tray_image(self.cfg["game_mode"], not on)
+        self.tray.update_menu()
+        if self.popup:
+            self.popup.refresh()
+
     def toggle_edit(self):
+        if not self.visible and not self.editing:
+            return
         self.editing = not self.editing
         self.canvas.itemconfigure(self.edit_border,
                                   state="normal" if self.editing else "hidden")
@@ -605,6 +637,9 @@ class Overlay:
         # The default item is what a left click on the tray icon triggers.
         menu = pystray.Menu(
             pystray.MenuItem("설정", call(self.toggle_settings), default=True),
+            pystray.MenuItem("오버레이 표시", lambda icon, item: self.calls.put(
+                (self.set_visible, (not self.visible,))),
+                checked=lambda item: self.visible),
             pystray.MenuItem("게임 모드", lambda icon, item: self.calls.put(
                 (self.set_game_mode, (not self.cfg["game_mode"],))),
                 checked=lambda item: self.cfg["game_mode"]),
@@ -633,8 +668,9 @@ class Overlay:
 
     def set_alpha(self, a):
         self.cfg["alpha"] = a
-        self.root.attributes("-alpha", a)
-        self._apply_click_through()
+        if self.visible:
+            self.root.attributes("-alpha", a)
+            self._apply_click_through()
         self._save()
 
     def _startup_command(self):
@@ -713,8 +749,11 @@ class Overlay:
                            f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)}")
 
     def _tick(self):
-        self._update()
-        self._keep_topmost()
+        if self.visible:
+            self._update()
+            self._keep_topmost()
+        else:
+            self.tray.title = "Perf Overlay (숨김)"  # nothing measured while hidden
         self.root.after(INTERVAL_MS, self._tick)
 
     def _keep_topmost(self):
