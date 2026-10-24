@@ -14,6 +14,7 @@ Requires: psutil, pystray, pillow. GPU stats use nvml.dll, which ships with
 the NVIDIA driver.
 """
 import ctypes
+import ctypes.wintypes as wintypes
 import json
 import os
 import queue
@@ -47,9 +48,14 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
-WS_EX_TOPMOST = 0x00000008
 HWND_TOPMOST = -1
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+GW_HWNDNEXT = 2
+DWMWA_CLOAKED = 14
+
+# Screen-capture tools the overlay must never cover (lowercase process names).
+CAPTURE_TOOLS = {"snippingtool.exe", "screenclippinghost.exe", "screensketch.exe",
+                 "sharex.exe", "greenshot.exe", "lightshot.exe", "picpick.exe"}
 
 STRINGS = {
     "ko": {
@@ -492,6 +498,7 @@ class Overlay:
         self.visible = True  # deliberately not saved: hiding is only "for a while"
         self.popup = None
         self.popup_closed_at = 0.0
+        self._proc_names = {}  # pid -> process name, for _keep_topmost()
         self.calls = queue.Queue()  # tray thread -> Tk thread
 
         self.root = root = tk.Tk()
@@ -850,15 +857,42 @@ class Overlay:
         self.root.after(INTERVAL_MS, self._tick)
 
     def _keep_topmost(self):
-        """Re-pin only if something actually dropped us out of the topmost band.
+        """Raise back to the top whenever another visible window overlaps us from above.
 
-        Re-raising on every tick would cover topmost windows opened later, such
-        as the Win+Shift+S capture screen, making screenshots look broken.
+        The WS_EX_TOPMOST bit alone can't be trusted: ordinary maximized windows
+        were seen stacked above the overlay while the bit stayed set. The one
+        exception is a screen-capture tool (Win+Shift+S etc.), which must stay on
+        top or screenshots look broken.
         """
         u = ctypes.windll.user32
-        if not u.GetWindowLongW(self.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST:
+        x0, y0 = self.root.winfo_x(), self.root.winfo_y()
+        x1, y1 = x0 + self.w, y0 + self.h
+        r, cloaked, pid = wintypes.RECT(), ctypes.c_int(), wintypes.DWORD()
+        covered = False
+        h = u.GetTopWindow(None)
+        while h and h != self.hwnd:  # walks the z-order from the top down to us
+            if u.IsWindowVisible(h) and not u.IsIconic(h):
+                u.GetWindowRect(h, ctypes.byref(r))
+                if r.left < x1 and r.right > x0 and r.top < y1 and r.bottom > y0:
+                    ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                        h, DWMWA_CLOAKED, ctypes.byref(cloaked), 4)
+                    u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                    if not cloaked.value and pid.value != os.getpid():
+                        if self._process_name(pid.value) in CAPTURE_TOOLS:
+                            return
+                        covered = True
+            h = u.GetWindow(h, GW_HWNDNEXT)
+        if covered:
             u.SetWindowPos(self.hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def _process_name(self, pid):
+        if pid not in self._proc_names:
+            try:
+                self._proc_names[pid] = psutil.Process(pid).name().lower()
+            except psutil.Error:
+                return ""
+        return self._proc_names[pid]
 
     def _update(self):
         """Refresh what's shown; game mode doesn't measure CPU or disks at all."""
