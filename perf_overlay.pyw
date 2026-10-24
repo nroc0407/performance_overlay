@@ -127,6 +127,15 @@ def fmt_rate(bps):
     return f"{bps:.1f} GB/s"
 
 
+def fmt_rate_short(bps):
+    """At most 4 characters: 512K, 2.1M, 85M."""
+    k = bps / 1024
+    if k < 999.5:
+        return f"{k:.0f}K"
+    m = k / 1024
+    return f"{m:.1f}M" if m < 9.95 else f"{m:.0f}M"
+
+
 def fmt_size(nbytes):
     gb = nbytes / 2**30
     return f"{gb / 1024:.1f} TB" if gb >= 1000 else f"{gb:.0f} GB"
@@ -271,7 +280,7 @@ class SettingsPopup:
         text.pack(side="left")
         tk.Label(text, text="게임 모드", bg=PANEL, fg=FG,
                  font=("Segoe UI Semibold", 10)).pack(anchor="w")
-        tk.Label(text, text="RAM · GPU · 네트워크만 표시", bg=PANEL, fg=DIM,
+        tk.Label(text, text="RAM · GPU · 네트워크만 한 줄로 표시", bg=PANEL, fg=DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
         self.game_toggle = Toggle(game, s, o.cfg["game_mode"], o.set_game_mode)
         self.game_toggle.c.pack(side="right")
@@ -402,7 +411,7 @@ class Overlay:
 
         s = root.winfo_fpixels("1i") / 96  # DPI scale factor
         self.s = s
-        self.w, self.row_h, self.pad = round(230 * s), round(30 * s), round(10 * s)
+        self.full_w, self.row_h, self.pad = round(230 * s), round(30 * s), round(10 * s)
         self.ncpu = psutil.cpu_count() or 1
         self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
         self.canvas.pack()
@@ -426,27 +435,68 @@ class Overlay:
 
     # ---- layout ----------------------------------------------------------
 
-    def _rows(self):
-        if self.cfg["game_mode"]:
-            return ["RAM", "GPU", "NET"]
-        return ["CPU", "RAM", "GPU", "NET"] + [d.rstrip("\\") for d in self.drives]
-
     def _build_rows(self):
-        """(Re)draw the rows for the current mode and resize the window to fit."""
+        """(Re)draw the layout for the current mode and resize the window to fit."""
+        c = self.canvas
+        c.delete("all")
+        self.items, self.cores, self.compact = {}, [], {}
+        if self.cfg["game_mode"]:
+            self._build_compact()
+        else:
+            self._build_full()
+        c.configure(width=self.w, height=self.h)
+        bw = max(3, round(3 * self.s))
+        self.edit_border = c.create_rectangle(bw // 2, bw // 2, self.w - bw // 2 - 1,
+                                              self.h - bw // 2 - 1, outline=ACCENT, width=bw,
+                                              state="normal" if self.editing else "hidden")
+        self.root.geometry(f"{self.w}x{self.h}")  # keeps the current position
+
+    def _build_compact(self):
+        """Game mode: one line of numbers, e.g.  RAM 65%  GPU 99%  ↓2.1M ↑5K"""
         s, c = self.s, self.canvas
-        rows = self._rows()
+        self.h = round(22 * s)
+        ty = self.h / 2
+        label_font = ("Segoe UI Semibold", 7)
+        value_font = ("Consolas", 9, "bold")
+        x = round(8 * s)
+
+        def label(text):
+            nonlocal x
+            i = c.create_text(x, ty, text=text, fill=DIM, font=label_font, anchor="w")
+            x = c.bbox(i)[2] + round(2 * s)
+
+        def value(key, widest, gap, align="e"):
+            # The slot is sized for the widest text, so nothing shifts as values change.
+            nonlocal x
+            i = c.create_text(x, ty, text=widest, font=value_font, anchor="w")
+            right = c.bbox(i)[2]
+            if align == "e":
+                c.coords(i, right, ty)
+            c.itemconfigure(i, text="--", fill=FG, anchor=align)
+            self.compact[key] = i
+            x = right + round(gap * s)
+
+        label("RAM")
+        value("RAM", "100%", 8)
+        label("GPU")
+        value("GPU", "100%", 8)
+        label("↓")
+        value("down", "999M", 4, align="w")
+        label("↑")
+        value("up", "999M", 0, align="w")
+        self.w = x + round(8 * s)
+
+    def _build_full(self):
+        s, c = self.s, self.canvas
+        self.w = self.full_w
+        rows = ["CPU", "RAM", "GPU", "NET"] + [d.rstrip("\\") for d in self.drives]
         core_h, core_gap = round(18 * s), round(4 * s)
-        # Per-thread strip under the CPU row.
-        strip_h = round(4 * s) + core_h + core_gap if "CPU" in rows else 0
+        strip_h = round(4 * s) + core_h + core_gap  # per-thread strip under the CPU row
         self.h = self.pad * 2 + self.row_h * len(rows) - round(6 * s) + strip_h
 
-        c.delete("all")
-        c.configure(width=self.w, height=self.h)
         label_font = ("Segoe UI Semibold", 9)
         detail_font = ("Segoe UI", 8)
         value_font = ("Consolas", 10, "bold")
-        self.items = {}
-        self.cores = []  # (bar id, x0, x1, top, bottom) per logical processor
         offset = 0
         for i, name in enumerate(rows):
             y = self.pad + i * self.row_h + offset
@@ -472,16 +522,15 @@ class Overlay:
                                             fill=load_color(0), width=0)
                     self.cores.append((cb, cx0, cx0 + cw, top, bottom))
                 offset = strip_h
-        bw = max(3, round(3 * s))
-        self.edit_border = c.create_rectangle(bw // 2, bw // 2, self.w - bw // 2 - 1,
-                                              self.h - bw // 2 - 1, outline=ACCENT, width=bw,
-                                              state="normal" if self.editing else "hidden")
-        self.root.geometry(f"{self.w}x{self.h}")  # keeps the current position
 
     def set_game_mode(self, on):
-        """Game mode shows only RAM / GPU / NET."""
+        """Game mode shrinks the overlay to one line: RAM / GPU / NET."""
+        right, y = self.root.winfo_x() + self.w, self.root.winfo_y()
         self.cfg["game_mode"] = on
         self._build_rows()
+        # Keep the right edge fixed so a top-right overlay stays in the corner.
+        self.root.geometry(f"+{right - self.w}+{y}")
+        self.root.update_idletasks()  # apply the move so _save() reads the new position
         self._update()
         self._save()
         self.tray.icon = tray_image(on)
@@ -499,15 +548,17 @@ class Overlay:
     def _place_initial(self):
         x, y = self.cfg["x"], self.cfg["y"]
         vl, vt, vr, vb = virtual_screen()
-        # Fall back to top-right if unset or the saved spot is now off-screen
-        # (e.g. a monitor was unplugged).
-        if x is None or y is None or not (vl <= x <= vr - 40 and vt <= y <= vb - 20):
+        if x is None or y is None:
             x, y = self._top_right()
+        # Keep the whole overlay on screen (e.g. after a monitor was unplugged).
+        x = min(max(x, vl), vr - self.w)
+        y = min(max(y, vt), vb - self.h)
         self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
 
     def reset_position(self):
         x, y = self._top_right()
         self.root.geometry(f"+{x}+{y}")
+        self.root.update_idletasks()
         self._save()
 
     # ---- click-through / edit mode ---------------------------------------
@@ -635,22 +686,45 @@ class Overlay:
         # Keep the detail text just left of the value, whose width varies.
         c.coords(d, c.bbox(v)[0] - round(8 * self.s), ty)
 
+    def _update_compact(self):
+        c, k = self.canvas, self.compact
+        # Plain white while fine; only warn colors (>=60%) stand out.
+        tint = lambda pct: FG if pct < 60 else load_color(pct)
+
+        vm = psutil.virtual_memory()
+        c.itemconfigure(k["RAM"], text=f"{vm.percent:.0f}%", fill=tint(vm.percent))
+
+        g = self.gpu.read()
+        if g is None:
+            c.itemconfigure(k["GPU"], text="N/A", fill=DIM)
+            gpu_txt = "N/A"
+        else:
+            c.itemconfigure(k["GPU"], text=f"{g[0]}%", fill=tint(g[0]))
+            gpu_txt = f"{g[0]}%"
+
+        down, up, _ = self.net.read() or (0.0, 0.0, 0)
+        c.itemconfigure(k["down"], text=fmt_rate_short(down))
+        c.itemconfigure(k["up"], text=fmt_rate_short(up))
+
+        self.tray.title = (f"[게임 모드] RAM {vm.percent:.0f}% · GPU {gpu_txt} · "
+                           f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)}")
+
     def _tick(self):
         self._update()
         self.root.attributes("-topmost", True)  # re-assert in case another window took it
         self.root.after(INTERVAL_MS, self._tick)
 
     def _update(self):
-        """Refresh the rows currently shown; hidden rows aren't measured at all."""
-        tip = []
-        if "CPU" in self.items:
-            per = psutil.cpu_percent(None, percpu=True)
-            cpu = sum(per) / len(per)
-            self._set_row("CPU", cpu, f"{len(per)} threads")
-            for (cb, cx0, cx1, top, bottom), pct in zip(self.cores, per):
-                self.canvas.coords(cb, cx0, bottom - (bottom - top) * pct / 100, cx1, bottom)
-                self.canvas.itemconfigure(cb, fill=load_color(pct))
-            tip.append(f"CPU {cpu:.0f}%")
+        """Refresh what's shown; game mode doesn't measure CPU or disks at all."""
+        if self.cfg["game_mode"]:
+            self._update_compact()
+            return
+        per = psutil.cpu_percent(None, percpu=True)
+        cpu = sum(per) / len(per)
+        self._set_row("CPU", cpu, f"{len(per)} threads")
+        for (cb, cx0, cx1, top, bottom), pct in zip(self.cores, per):
+            self.canvas.coords(cb, cx0, bottom - (bottom - top) * pct / 100, cx1, bottom)
+            self.canvas.itemconfigure(cb, fill=load_color(pct))
 
         vm = psutil.virtual_memory()
         self._set_row("RAM", vm.percent,
@@ -675,8 +749,6 @@ class Overlay:
 
         for drive in self.drives:
             name = drive.rstrip("\\")
-            if name not in self.items:
-                continue
             try:
                 u = psutil.disk_usage(drive)
             except OSError:
@@ -685,9 +757,7 @@ class Overlay:
             self._set_row(name, u.percent, f"{u.percent:.0f}% of {fmt_size(u.total)}",
                           f"{fmt_size(u.free)} free")
 
-        tip += [f"RAM {vm.percent:.0f}%", f"GPU {gpu_txt}"]
-        prefix = "[게임 모드] " if self.cfg["game_mode"] else ""
-        self.tray.title = prefix + " · ".join(tip)
+        self.tray.title = f"CPU {cpu:.0f}% · RAM {vm.percent:.0f}% · GPU {gpu_txt}"
 
     def run(self):
         self.root.mainloop()
