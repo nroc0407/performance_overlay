@@ -82,6 +82,10 @@ STRINGS = {
         "move_mode": "위치 편집 모드",
         "hidden_tip": "Perf Overlay (숨김)",
         "game_tip": "[게임 모드]",
+        "game_tip_auto": "[게임 모드 · 자동]",
+        "auto_game": "게임 실행 시 자동 전환",
+        "auto_game_sub": "게임이 켜지면 게임 모드, 끄면 원래대로",
+        "auto_game_on": "감지됨: {name}",
         "threads": "{n} 스레드",
         "disk_used": "{pct}% 사용 / {total}",
         "disk_free": "{free} 여유",
@@ -104,6 +108,10 @@ STRINGS = {
         "move_mode": "Move mode",
         "hidden_tip": "Perf Overlay (hidden)",
         "game_tip": "[Game mode]",
+        "game_tip_auto": "[Game mode · auto]",
+        "auto_game": "Auto-switch for games",
+        "auto_game_sub": "Game mode while a game is running",
+        "auto_game_on": "Detected: {name}",
         "threads": "{n} threads",
         "disk_used": "{pct}% of {total}",
         "disk_free": "{free} free",
@@ -252,6 +260,89 @@ Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t -Principal
         print(time.strftime("%Y-%m-%d %H:%M:%S"), "startup task failed:", r.stderr.strip(),
               file=sys.stderr)
     return r.returncode == 0
+
+
+# Store install folders whose executables count as games (matched lowercase).
+GAME_DIRS = ("\\steamapps\\common\\", "\\riot games\\", "\\epic games\\",
+             "\\gog games\\", "\\xboxgames\\")
+# Launchers, clients and crash handlers living in those folders or in Windows'
+# game list that shouldn't flip the overlay into game mode.
+NOT_GAMES = {"steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe",
+             "riotclientservices.exe", "riotclientux.exe", "riotclientuxrender.exe",
+             "leagueclient.exe", "leagueclientux.exe", "leagueclientuxrender.exe",
+             "unitycrashhandler64.exe", "unitycrashhandler32.exe", "crashreportclient.exe"}
+
+
+def foreground_pid():
+    pid = wintypes.DWORD()
+    u = ctypes.windll.user32
+    u.GetWindowThreadProcessId(u.GetForegroundWindow(), ctypes.byref(pid))
+    return pid.value
+
+
+class GameDetector:
+    """Decides whether a process is a game.
+
+    A process counts if its exe is in Windows' own Game Bar list
+    (HKCU\\System\\GameConfigStore), sits under a store install folder (Steam,
+    Riot, Epic, GOG, Xbox), or is listed in the config's "extra_games".
+    """
+
+    def __init__(self, extra=(), ignore=()):
+        self.extra = {e.lower() for e in extra}
+        self.ignore = NOT_GAMES | {e.lower() for e in ignore}
+        self.known, self.known_names, self.loaded_at = set(), set(), -1e9
+
+    def _reload(self):
+        known = set()
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"System\GameConfigStore\Children") as k:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with winreg.OpenKey(k, sub) as sk:
+                            exe, _ = winreg.QueryValueEx(sk, "MatchedExeFullPath")
+                            known.add(os.path.normcase(exe))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        self.known = known
+        self.known_names = {os.path.basename(p) for p in known}
+        self.loaded_at = time.monotonic()
+
+    def match(self, pid):
+        """Returns (create_time, exe name) if pid is a game, else None."""
+        if time.monotonic() - self.loaded_at > 300:  # Game Bar learns new games over time
+            self._reload()
+        try:
+            p = psutil.Process(pid)
+            created = p.create_time()
+        except psutil.Error:
+            return None
+        try:
+            exe = os.path.normcase(p.exe())  # lowercase on Windows
+            name = os.path.basename(exe)
+        except psutil.Error:  # e.g. an elevated game: only its name is readable
+            exe = None
+            try:
+                name = p.name().lower()
+            except psutil.Error:
+                return None
+        if name in self.ignore:
+            return None
+        if exe is None:
+            hit = name in self.extra or name in self.known_names
+        else:
+            hit = (exe in self.known or exe in self.extra or name in self.extra
+                   or any(d in exe for d in GAME_DIRS))
+        return (created, name) if hit else None
 
 
 def migrate_legacy_startup():
@@ -408,6 +499,8 @@ class SettingsPopup:
                                             o.visible, o.set_visible)
         self.game_toggle = self._toggle_row(body, t("game"), t("game_sub"),
                                             o.cfg["game_mode"], o.set_game_mode)
+        self.auto_toggle = self._toggle_row(body, t("auto_game"), t("auto_game_sub"),
+                                            o.cfg["auto_game"], o.set_auto_game)
 
         self._section(body, t("position"))
         self.pos_row = row = tk.Frame(body, bg=PANEL)
@@ -468,9 +561,11 @@ class SettingsPopup:
         text.pack(side="left")
         tk.Label(text, text=title, bg=PANEL, fg=FG,
                  font=("Segoe UI Semibold", 10)).pack(anchor="w")
-        tk.Label(text, text=subtitle, bg=PANEL, fg=DIM, font=("Segoe UI", 8)).pack(anchor="w")
+        sub = tk.Label(text, text=subtitle, bg=PANEL, fg=DIM, font=("Segoe UI", 8))
+        sub.pack(anchor="w")
         toggle = Toggle(row, s, value, on_change)
         toggle.c.pack(side="right")
+        toggle.subtitle, toggle.default_subtitle = sub, subtitle
         return toggle
 
     def _section(self, parent, text):
@@ -493,6 +588,12 @@ class SettingsPopup:
         """Sync the controls with state that may also change from the tray menu."""
         self.show_toggle.set(self.o.visible)
         self.game_toggle.set(self.o.cfg["game_mode"])
+        a = self.auto_toggle
+        a.set(self.o.cfg["auto_game"])
+        if self.o.game:
+            a.subtitle.configure(text=self.o.t("auto_game_on", name=self.o.game[2]), fg=ACCENT)
+        else:
+            a.subtitle.configure(text=a.default_subtitle, fg=DIM)
         b = self.edit_btn
         b.base = ACCENT if self.o.editing else BTN
         b.configure(text=self.o.t("done" if self.o.editing else "move"), bg=b.base,
@@ -540,7 +641,8 @@ class SettingsPopup:
 class Overlay:
     def __init__(self):
         self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"],
-                    "game_mode": False, "lang": default_language()}
+                    "game_mode": False, "lang": default_language(),
+                    "auto_game": True, "extra_games": [], "not_games": []}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 self.cfg.update(json.load(f))
@@ -558,6 +660,10 @@ class Overlay:
         self.popup = None
         self.popup_closed_at = 0.0
         self._proc_names = {}  # pid -> process name, for _keep_topmost()
+        self.games = GameDetector(self.cfg["extra_games"], self.cfg["not_games"])
+        self.game = None          # (pid, create_time, exe name) of the detected game
+        self.auto_active = False  # game mode is on because of self.game, not by hand
+        self.ticks = 0
         self.calls = queue.Queue()  # tray thread -> Tk thread
 
         self.root = root = tk.Tk()
@@ -697,8 +803,14 @@ class Overlay:
                     self.cores.append((cb, cx0, cx0 + cw, top, bottom))
                 offset = strip_h
 
-    def set_game_mode(self, on):
-        """Game mode shrinks the overlay to one line: RAM / GPU / NET."""
+    def set_game_mode(self, on, manual=True):
+        """Game mode shrinks the overlay to one line: RAM / GPU / NET.
+
+        A manual change takes over from auto mode: it's not undone when the
+        detected game exits.
+        """
+        if manual:
+            self.auto_active = False
         right, y = self.root.winfo_x() + self.w, self.root.winfo_y()
         self.cfg["game_mode"] = on
         self._build_rows()
@@ -711,6 +823,52 @@ class Overlay:
         self.tray.update_menu()
         if self.popup:
             self.popup.refresh()
+
+    # ---- auto game mode --------------------------------------------------
+
+    def set_auto_game(self, on):
+        self.cfg["auto_game"] = on
+        if not on:
+            self.game = None
+            if self.auto_active:
+                self.auto_active = False
+                self.set_game_mode(False, manual=False)
+        self._save()
+        if self.popup:
+            self.popup.refresh()
+
+    def _check_game(self):
+        """Enter game mode when a game comes to the front; leave when it exits.
+
+        Alt-tabbing out doesn't count as leaving, so the overlay doesn't flip
+        back and forth mid-game. Turning game mode off by hand while a game runs
+        sticks until that game exits.
+        """
+        if self.game:
+            pid, created, _ = self.game
+            try:
+                alive = psutil.Process(pid).create_time() == created
+            except psutil.Error:
+                alive = False
+            if not alive:
+                self.game = None
+                if self.auto_active:
+                    self.auto_active = False
+                    self.set_game_mode(False, manual=False)
+                elif self.popup:
+                    self.popup.refresh()
+            return
+        pid = foreground_pid()
+        if not pid or pid == os.getpid():
+            return
+        found = self.games.match(pid)
+        if found:
+            self.game = (pid, *found)
+            if not self.cfg["game_mode"]:
+                self.auto_active = True
+                self.set_game_mode(True, manual=False)
+            elif self.popup:
+                self.popup.refresh()
 
     # ---- placement -------------------------------------------------------
 
@@ -845,9 +1003,12 @@ class Overlay:
 
     def _save(self):
         self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
+        data = dict(self.cfg)
+        if self.auto_active:  # store the hand-picked mode, not the temporary one
+            data["game_mode"] = False
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, indent=2)
+                json.dump(data, f, indent=2)
         except OSError:
             pass
 
@@ -889,11 +1050,15 @@ class Overlay:
         c.itemconfigure(k["down"], text=fmt_rate_short(down))
         c.itemconfigure(k["up"], text=fmt_rate_short(up))
 
-        self.tray.title = (f"{self.t('game_tip')} RAM {vm.percent:.0f}% · GPU {gpu_txt} · "
+        tip = self.t("game_tip_auto" if self.auto_active else "game_tip")
+        self.tray.title = (f"{tip} RAM {vm.percent:.0f}% · GPU {gpu_txt} · "
                            f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)}")
 
     def _tick(self):
+        self.ticks += 1
         if self.visible:
+            if self.cfg["auto_game"] and self.ticks % 2 == 0:
+                self._check_game()
             self._update()
             self._keep_topmost()
         else:
