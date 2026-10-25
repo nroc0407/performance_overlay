@@ -18,9 +18,12 @@ import ctypes.wintypes as wintypes
 import json
 import os
 import queue
+import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
+import traceback
 import winreg
 
 import psutil
@@ -29,6 +32,9 @@ from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "perf_overlay.json")
+LOG_PATH = os.path.join(HERE, "perf_overlay.log")
+TASK_NAME = "PerfOverlay"
+# Older versions registered here; Windows' startup-app runner was seen skipping it.
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "PerfOverlay"
 INTERVAL_MS = 1000
@@ -205,6 +211,59 @@ def fmt_rate_short(bps):
 def fmt_size(nbytes):
     gb = nbytes / 2**30
     return f"{gb / 1024:.1f} TB" if gb >= 1000 else f"{gb:.0f} GB"
+
+
+def _run_hidden(args):
+    return subprocess.run(args, capture_output=True, text=True,
+                          creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def startup_task_exists():
+    return _run_hidden(["schtasks", "/Query", "/TN", TASK_NAME]).returncode == 0
+
+
+def set_startup_task(enable):
+    """Start with Windows via a per-user Task Scheduler logon task.
+
+    A logon task doesn't need admin when it's limited to the current user, and
+    unlike the Run key it isn't subject to the startup-app runner skipping it.
+    The 15 s delay lets the taskbar come up so the tray icon can register.
+    """
+    if enable:
+        exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(exe):
+            exe = sys.executable
+        script = os.path.abspath(__file__)
+        ps = f"""
+$u = "$env:USERDOMAIN\\$env:USERNAME"
+$a = New-ScheduledTaskAction -Execute '{exe}' -Argument '"{script}"' -WorkingDirectory '{HERE}'
+$t = New-ScheduledTaskTrigger -AtLogOn -User $u
+$t.Delay = 'PT15S'
+$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited
+$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction Stop | Out-Null
+"""
+    else:
+        ps = f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue"
+    r = _run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+    if r.returncode != 0:
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "startup task failed:", r.stderr.strip(),
+              file=sys.stderr)
+    return r.returncode == 0
+
+
+def migrate_legacy_startup():
+    """Move a Run-key registration from older versions over to the logon task."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as k:
+            winreg.QueryValueEx(k, RUN_NAME)
+            if set_startup_task(True):
+                winreg.DeleteValue(k, RUN_NAME)
+    except OSError:
+        pass  # no legacy entry
 
 
 def work_area():
@@ -773,27 +832,12 @@ class Overlay:
             self._apply_click_through()
         self._save()
 
-    def _startup_command(self):
-        exe = sys.executable
-        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if os.path.exists(pyw):
-            exe = pyw
-        return f'"{exe}" "{os.path.abspath(__file__)}"'
-
     def _startup_enabled(self):
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-                winreg.QueryValueEx(k, RUN_NAME)
-            return True
-        except OSError:
-            return False
+        return startup_task_exists()
 
     def set_startup(self, enable):
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-            if enable:
-                winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, self._startup_command())
-            elif self._startup_enabled():
-                winreg.DeleteValue(k, RUN_NAME)
+        # Registering a task goes through PowerShell (~1-2 s); keep the UI responsive.
+        threading.Thread(target=set_startup_task, args=(enable,), daemon=True).start()
 
     def quit(self):
         self.tray.stop()
@@ -944,9 +988,38 @@ class Overlay:
         self.root.mainloop()
 
 
+def setup_logging():
+    """pythonw has no console, so errors would vanish; send them to perf_overlay.log."""
+    if sys.stderr is not None:
+        return
+    try:
+        if os.path.getsize(LOG_PATH) > 1_000_000:
+            os.remove(LOG_PATH)
+    except OSError:
+        pass
+    log = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = log
+
+
+def already_running():
+    """Single instance: a named mutex stays held for as long as this process lives."""
+    global _instance_mutex
+    _instance_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\PerfOverlay")
+    return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+
+
 if __name__ == "__main__":
+    if already_running():
+        sys.exit(0)
+    setup_logging()
     try:  # per-monitor DPI awareness for crisp text and correct coordinates
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
-    Overlay().run()
+    try:
+        migrate_legacy_startup()
+        Overlay().run()
+    except Exception:
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "crashed:", file=sys.stderr)
+        traceback.print_exc()
+        raise

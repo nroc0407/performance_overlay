@@ -1,2 +1,4 @@
 # per-machine overlay position/opacity
 perf_overlay.json
+# error log written when run without a console (pythonw)
+perf_overlay.log

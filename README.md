@@ -26,4 +26,6 @@ pythonw perf_overlay.pyw
 ```
 
 - GPU 수치는 NVIDIA 드라이버에 포함된 `nvml.dll`을 사용한다. NVIDIA GPU가 없으면 `N/A`로 표시된다.
+- "Windows 시작 시 실행"은 작업 스케줄러에 현재 사용자 전용 로그온 작업(`PerfOverlay`, 15초 지연)으로 등록된다. 관리자 권한은 필요 없다.
+- 콘솔 없이 실행할 때 생기는 오류는 `perf_overlay.log`에 남는다.
 - 설정(위치, 투명도, 게임 모드, 표시할 드라이브)은 같은 폴더의 `perf_overlay.json`에 저장된다. 표시할 드라이브는 `"drives": ["C:\\", "D:\\"]`로 바꿀 수 있다.
