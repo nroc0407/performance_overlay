@@ -33,6 +33,8 @@ from PIL import Image, ImageDraw
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "perf_overlay.json")
 LOG_PATH = os.path.join(HERE, "perf_overlay.log")
+RESTART_FLAG = "--restarted-at"  # followed by the epoch time of an nvml.dll-fault restart
+_instance_mutex = None
 TASK_NAME = "PerfOverlay"
 # Older versions registered here; Windows' startup-app runner was seen skipping it.
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -150,25 +152,60 @@ class Gpu:
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
                     ("used", ctypes.c_ulonglong)]
 
+    RETRY_S = 5
+
     def __init__(self):
         self.handle = None
+        self.nvml = None
+        self.retry_at = 0.0
+        self.crashed = False  # nvml.dll faulted; it can't be used again in this process
         try:
             self.nvml = ctypes.WinDLL("nvml.dll")
+        except OSError:
+            return  # no NVIDIA driver
+        self._connect()
+
+    def _connect(self):
+        self.handle = None
+        try:
+            self.nvml.nvmlShutdown()  # harmless if not initialized; drops a stale session
             if self.nvml.nvmlInit_v2() == 0:
                 h = ctypes.c_void_p()
                 if self.nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h)) == 0:
                     self.handle = h
         except OSError:
             pass
+        if self.handle is None:
+            self.retry_at = time.monotonic() + self.RETRY_S
 
     def read(self):
-        """Returns (util %, used GB, total GB), or None if unavailable."""
+        """Returns (util %, used GB, total GB), or None if unavailable.
+
+        An error code (e.g. GPU lost, driver not ready at logon) reconnects a few
+        seconds later. An access violation inside nvml.dll (seen once, likely a
+        stale handle after a driver reset) is different: nvml stays locked up in
+        this process and any further call hangs, so it sets `crashed` and the
+        overlay restarts itself.
+        """
+        if self.nvml is None or self.crashed:
+            return None
         if self.handle is None:
-            return None
+            if time.monotonic() < self.retry_at:
+                return None
+            self._connect()
+            if self.handle is None:
+                return None
         util, mem = self._Util(), self._Mem()
-        if self.nvml.nvmlDeviceGetUtilizationRates(self.handle, ctypes.byref(util)) != 0:
+        try:
+            ok = (self.nvml.nvmlDeviceGetUtilizationRates(self.handle, ctypes.byref(util)) == 0
+                  and self.nvml.nvmlDeviceGetMemoryInfo(self.handle, ctypes.byref(mem)) == 0)
+        except OSError:  # access violation inside nvml.dll
+            self.crashed, self.handle = True, None
             return None
-        self.nvml.nvmlDeviceGetMemoryInfo(self.handle, ctypes.byref(mem))
+        if not ok:
+            self.handle = None
+            self.retry_at = time.monotonic() + self.RETRY_S
+            return None
         return util.gpu, mem.used / 2**30, mem.total / 2**30
 
 
@@ -688,6 +725,7 @@ class Overlay:
         root.attributes("-topmost", True)
         root.attributes("-alpha", self.cfg["alpha"])
         root.configure(bg=BG)
+        root.report_callback_exception = self._log_error
 
         s = root.winfo_fpixels("1i") / 96  # DPI scale factor
         self.s = s
@@ -713,6 +751,12 @@ class Overlay:
         self._pump_calls()
         self._tick()
         self._poll_cursor()
+
+    @staticmethod
+    def _log_error(exc, val, tb):
+        """Tk callback errors, timestamped (stderr is perf_overlay.log under pythonw)."""
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "error in callback:", file=sys.stderr)
+        traceback.print_exception(exc, val, tb)
 
     # ---- language --------------------------------------------------------
 
@@ -995,10 +1039,10 @@ class Overlay:
             self.popup = SettingsPopup(self)
 
     def _pump_calls(self):
+        self.root.after(100, self._pump_calls)  # first, so one failing call can't stop it
         while not self.calls.empty():
             fn, args = self.calls.get_nowait()
             fn(*args)
-        self.root.after(100, self._pump_calls)
 
     def set_alpha(self, a):
         self.cfg["alpha"] = a
@@ -1034,6 +1078,7 @@ class Overlay:
         It comes back once the cursor has been clearly away for a moment, so
         brushing past the edge doesn't make it flicker.
         """
+        self.root.after(80, self._poll_cursor)
         hide = False
         if self.visible and not self.editing and self.cfg["hover_hide"]:
             px, py = cursor_pos()
@@ -1050,7 +1095,6 @@ class Overlay:
             self.hover_hidden = hide
             if not self._fade_job:
                 self._fade()
-        self.root.after(80, self._poll_cursor)
 
     def _startup_enabled(self):
         return startup_task_exists()
@@ -1117,6 +1161,9 @@ class Overlay:
                            f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)}")
 
     def _tick(self):
+        # Schedule first: an error below gets logged but must not stop the loop
+        # (a GPU read crash once left the overlay frozen).
+        self.root.after(INTERVAL_MS, self._tick)
         self.ticks += 1
         if self.visible:
             if self.cfg["auto_game"] and self.ticks % 2 == 0:
@@ -1125,7 +1172,35 @@ class Overlay:
             self._keep_topmost()
         else:
             self.tray.title = self.t("hidden_tip")  # nothing measured while hidden
-        self.root.after(INTERVAL_MS, self._tick)
+        if self.gpu.crashed and not self._restarted_recently():
+            self._restart()
+
+    @staticmethod
+    def _restarted_recently():
+        """True within 10 minutes of a fault restart: then GPU just shows N/A
+        instead of restarting in a loop if nvml keeps faulting."""
+        try:
+            at = float(sys.argv[sys.argv.index(RESTART_FLAG) + 1])
+        except (ValueError, IndexError):
+            return False
+        return time.time() - at < 600
+
+    def _restart(self):
+        """Replace this process with a fresh one after nvml.dll faulted."""
+        global _instance_mutex
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "nvml.dll faulted; restarting", file=sys.stderr)
+        k32 = ctypes.windll.kernel32
+        if _instance_mutex:  # let the new process take the single-instance mutex
+            k32.CloseHandle(wintypes.HANDLE(_instance_mutex))
+            _instance_mutex = None
+        exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        subprocess.Popen([exe if os.path.exists(exe) else sys.executable,
+                          os.path.abspath(__file__), RESTART_FLAG, str(time.time())],
+                         cwd=HERE, creationflags=subprocess.DETACHED_PROCESS)
+        self._save()
+        self.tray.stop()  # remove the tray icon now rather than leaving a ghost
+        # Skip normal shutdown: unloading the faulted nvml.dll can hang.
+        k32.TerminateProcess(wintypes.HANDLE(-1), 0)  # -1 = this process
 
     def _keep_topmost(self):
         """Raise back to the top whenever another visible window overlaps us from above.
