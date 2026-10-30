@@ -86,6 +86,8 @@ STRINGS = {
         "auto_game": "게임 실행 시 자동 전환",
         "auto_game_sub": "게임이 켜지면 게임 모드, 끄면 원래대로",
         "auto_game_on": "감지됨: {name}",
+        "hover_hide": "마우스 올리면 숨기기",
+        "hover_hide_sub": "커서가 오면 사라지고, 벗어나면 다시 표시",
         "threads": "{n} 스레드",
         "disk_used": "{pct}% 사용 / {total}",
         "disk_free": "{free} 여유",
@@ -112,6 +114,8 @@ STRINGS = {
         "auto_game": "Auto-switch for games",
         "auto_game_sub": "Game mode while a game is running",
         "auto_game_on": "Detected: {name}",
+        "hover_hide": "Hide on mouse-over",
+        "hover_hide_sub": "Fades out while the cursor is over it",
         "threads": "{n} threads",
         "disk_used": "{pct}% of {total}",
         "disk_free": "{free} free",
@@ -271,6 +275,12 @@ NOT_GAMES = {"steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe",
              "riotclientservices.exe", "riotclientux.exe", "riotclientuxrender.exe",
              "leagueclient.exe", "leagueclientux.exe", "leagueclientuxrender.exe",
              "unitycrashhandler64.exe", "unitycrashhandler32.exe", "crashreportclient.exe"}
+
+
+def cursor_pos():
+    pt = wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
 
 
 def foreground_pid():
@@ -501,6 +511,8 @@ class SettingsPopup:
                                             o.cfg["game_mode"], o.set_game_mode)
         self.auto_toggle = self._toggle_row(body, t("auto_game"), t("auto_game_sub"),
                                             o.cfg["auto_game"], o.set_auto_game)
+        self._toggle_row(body, t("hover_hide"), t("hover_hide_sub"),
+                         o.cfg["hover_hide"], o.set_hover_hide)
 
         self._section(body, t("position"))
         self.pos_row = row = tk.Frame(body, bg=PANEL)
@@ -642,7 +654,8 @@ class Overlay:
     def __init__(self):
         self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"],
                     "game_mode": False, "lang": default_language(),
-                    "auto_game": True, "extra_games": [], "not_games": []}
+                    "auto_game": True, "extra_games": [], "not_games": [],
+                    "hover_hide": True}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 self.cfg.update(json.load(f))
@@ -664,6 +677,10 @@ class Overlay:
         self.game = None          # (pid, create_time, exe name) of the detected game
         self.auto_active = False  # game mode is on because of self.game, not by hand
         self.ticks = 0
+        self.hover_hidden = False   # faded out because the cursor is over the overlay
+        self._left_at = None        # when the cursor last moved off, while hover-hidden
+        self._fade_job = None
+        self.cur_alpha = self.cfg["alpha"]
         self.calls = queue.Queue()  # tray thread -> Tk thread
 
         self.root = root = tk.Tk()
@@ -695,6 +712,7 @@ class Overlay:
         self._build_tray()
         self._pump_calls()
         self._tick()
+        self._poll_cursor()
 
     # ---- language --------------------------------------------------------
 
@@ -911,8 +929,7 @@ class Overlay:
         if not on and self.editing:
             self.toggle_edit()
         self.visible = on
-        self.root.attributes("-alpha", self.cfg["alpha"] if on else 0.0)
-        self._apply_click_through()
+        self._set_alpha_now(self._target_alpha())
         if on:
             self._update()
         self.tray.icon = tray_image(self.cfg["game_mode"], not on)
@@ -985,10 +1002,55 @@ class Overlay:
 
     def set_alpha(self, a):
         self.cfg["alpha"] = a
-        if self.visible:
-            self.root.attributes("-alpha", a)
-            self._apply_click_through()
+        self._set_alpha_now(self._target_alpha())
         self._save()
+
+    def set_hover_hide(self, on):
+        self.cfg["hover_hide"] = on
+        self._save()
+
+    # ---- hover to hide ---------------------------------------------------
+
+    def _target_alpha(self):
+        return 0.0 if not self.visible or self.hover_hidden else self.cfg["alpha"]
+
+    def _set_alpha_now(self, a):
+        self.cur_alpha = a
+        self.root.attributes("-alpha", a)
+        self._apply_click_through()  # keep the click-through bits after Tk touches the style
+
+    def _fade(self):
+        """Step toward the target alpha; a full fade takes about 100 ms."""
+        target, step = self._target_alpha(), 0.15
+        a = self.cur_alpha
+        a = target if abs(a - target) <= step else a + (step if target > a else -step)
+        self._set_alpha_now(a)
+        self._fade_job = self.root.after(15, self._fade) if a != target else None
+
+    def _poll_cursor(self):
+        """Fade out while the cursor is over the overlay so whatever is under it shows.
+
+        The overlay is click-through, so it gets no mouse events; poll instead.
+        It comes back once the cursor has been clearly away for a moment, so
+        brushing past the edge doesn't make it flicker.
+        """
+        hide = False
+        if self.visible and not self.editing and self.cfg["hover_hide"]:
+            px, py = cursor_pos()
+            x0, y0 = self.root.winfo_x(), self.root.winfo_y()
+            m = round((24 if self.hover_hidden else 4) * self.s)
+            inside = x0 - m <= px < x0 + self.w + m and y0 - m <= py < y0 + self.h + m
+            if inside:
+                hide, self._left_at = True, None
+            elif self.hover_hidden:
+                if self._left_at is None:
+                    self._left_at = time.monotonic()
+                hide = time.monotonic() - self._left_at < 0.3
+        if hide != self.hover_hidden:
+            self.hover_hidden = hide
+            if not self._fade_job:
+                self._fade()
+        self.root.after(80, self._poll_cursor)
 
     def _startup_enabled(self):
         return startup_task_exists()
