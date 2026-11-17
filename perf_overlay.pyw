@@ -1,6 +1,8 @@
 """Tiny always-on-top overlay showing CPU / RAM / GPU usage and per-drive
 free space, read / write speed and active time.
 
+- By default it's one line (game mode) and switches to the full view (CPU
+  threads, drives) only while the desktop is in front.
 - The overlay ignores the mouse (clicks pass through to whatever is below).
 - Clicking the tray icon (taskbar, bottom-right) opens a settings popup:
   show/hide the overlay for a while, game mode (RAM / GPU / network / ping), edit mode (drag to move), reset position,
@@ -72,6 +74,8 @@ STRINGS = {
         "show_sub": "끄면 다시 켤 때까지 숨김",
         "game": "게임 모드",
         "game_sub": "RAM · GPU · 네트워크 · 핑을 한 줄로 표시",
+        "desktop_detail": "바탕화면에서는 상세 표시",
+        "desktop_detail_sub": "바탕화면이 앞에 오면 CPU · 드라이브까지 표시",
         "position": "위치",
         "move": "위치 편집",
         "done": "완료",
@@ -103,6 +107,8 @@ STRINGS = {
         "show_sub": "Hidden until you turn it back on",
         "game": "Game mode",
         "game_sub": "RAM · GPU · network · ping on one line",
+        "desktop_detail": "Full view on the desktop",
+        "desktop_detail_sub": "Adds CPU and drives while the desktop is in front",
         "position": "Position",
         "move": "Move",
         "done": "Done",
@@ -553,6 +559,30 @@ def foreground_pid():
     return pid.value
 
 
+# Window classes of the desktop itself (Win+D, a click on the wallpaper).
+DESKTOP_CLASSES = {"Progman", "WorkerW"}
+# Shell surfaces that come and go on top of whatever was in front (taskbar,
+# tray overflow, Alt+Tab, Task View); they don't change desktop vs. app.
+SHELL_CLASSES = {"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
+                 "TopLevelWindowForOverflowXamlIsland", "XamlExplorerHostIslandWindow",
+                 "MultitaskingViewFrame", "ForegroundStaging"}
+SHELL_HOSTS = {"startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
+               "shellexperiencehost.exe"}  # Start, search, notification center
+
+
+def foreground_window():
+    """(class name, pid) of the foreground window, or None if there is none."""
+    u = ctypes.windll.user32
+    h = u.GetForegroundWindow()
+    if not h:
+        return None
+    buf = ctypes.create_unicode_buffer(64)
+    u.GetClassNameW(h, buf, 64)
+    pid = wintypes.DWORD()
+    u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+    return buf.value, pid.value
+
+
 class GameDetector:
     """Decides whether a process is a game.
 
@@ -772,6 +802,8 @@ class SettingsPopup:
                                             o.visible, o.set_visible)
         self.game_toggle = self._toggle_row(body, t("game"), t("game_sub"),
                                             o.cfg["game_mode"], o.set_game_mode)
+        self._toggle_row(body, t("desktop_detail"), t("desktop_detail_sub"),
+                         o.cfg["desktop_detail"], o.set_desktop_detail)
         self.auto_toggle = self._toggle_row(body, t("auto_game"), t("auto_game_sub"),
                                             o.cfg["auto_game"], o.set_auto_game)
         self._toggle_row(body, t("hover_hide"), t("hover_hide_sub"),
@@ -916,14 +948,22 @@ class SettingsPopup:
 class Overlay:
     def __init__(self):
         self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"],
-                    "game_mode": False, "lang": default_language(),
+                    "game_mode": True, "desktop_detail": True, "lang": default_language(),
                     "auto_game": True, "extra_games": [], "not_games": [],
                     "hover_hide": True, "ping_host": "1.1.1.1", "usb_drives": True}
+        saved = {}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
-                self.cfg.update(json.load(f))
-        except (OSError, ValueError):
+                saved = json.load(f)
+            self.cfg.update(saved)
+        except (OSError, ValueError, TypeError):
             pass
+        # Settings from before "desktop_detail" existed: game mode was off by
+        # default, and x / y belong to the full layout if that was showing.
+        # Move them over to the new default (one line, full view on the desktop) once.
+        legacy_full = bool(saved) and "desktop_detail" not in saved and not saved.get("game_mode")
+        if saved and "desktop_detail" not in saved:
+            self.cfg["game_mode"] = True
         if self.cfg["lang"] not in STRINGS:
             self.cfg["lang"] = "en"
 
@@ -961,13 +1001,19 @@ class Overlay:
         self.ncpu = psutil.cpu_count() or 1
         self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
         self.canvas.pack()
+        self.on_desktop = bool(self._desktop_in_front())
+        # The saved position is the one-line layout's; the full one is placed from it.
+        self.compact_size = self._measure(True)
+        old_size = self._measure(False) if legacy_full else None
         self._build_rows()
 
-        self._place_initial()
+        self._place_initial(old_size)
         root.update_idletasks()
         self.hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         round_corners(self.hwnd)
         self._apply_click_through()
+        if saved and "desktop_detail" not in saved:
+            self._save()  # write the migrated settings right away
 
         # Bound on the toplevel only: its bindtag also covers the canvas.
         root.bind("<ButtonPress-1>", self._drag_start)
@@ -1035,22 +1081,47 @@ class Overlay:
             io.close()
         return True
 
-    def _resize_rows(self):
-        """Redraw after a drive row came or went, growing away from the nearer screen edge."""
-        x, y, h = self.root.winfo_x(), self.root.winfo_y(), self.h
-        self._build_rows()
+    @staticmethod
+    def _convert(rect, size):
+        """Top-left of a window of `size` that takes the place of `rect` (x, y, w, h).
+
+        The right edge stays put, so a top-right overlay stays in the corner; in
+        the lower half of the screen the bottom edge stays put too, so it grows
+        upward instead of off the screen.
+        """
+        x, y, w, h = rect
+        nw, nh = size
         _, top, _, bottom = virtual_screen()
-        if y + h / 2 > (top + bottom) / 2:  # in the lower half: keep the bottom edge in place
-            self.root.geometry(f"+{x}+{y + h - self.h}")
+        if y + h / 2 > (top + bottom) / 2:
+            y += h - nh
+        return x + w - nw, y
+
+    def _rebuild(self):
+        """Redraw for the current mode / drives, keeping the overlay anchored."""
+        rect = (self.root.winfo_x(), self.root.winfo_y(), self.w, self.h)
+        self._build_rows()
+        x, y = self._convert(rect, (self.w, self.h))
+        self.root.geometry(f"+{x}+{y}")
+        self.root.update_idletasks()  # apply the move so _save() reads the new position
 
     # ---- layout ----------------------------------------------------------
 
-    def _build_rows(self):
+    def _want_compact(self):
+        """One line in game mode, except while the desktop is in front (if enabled)."""
+        return self.cfg["game_mode"] and not (self.cfg["desktop_detail"] and self.on_desktop)
+
+    def _measure(self, compact):
+        """Builds a layout just to learn its (width, height)."""
+        self._build_rows(compact)
+        return self.w, self.h
+
+    def _build_rows(self, compact=None):
         """(Re)draw the layout for the current mode and resize the window to fit."""
         c = self.canvas
         c.delete("all")
         self.items, self.cores, self.compact, self.io_items = {}, [], {}, {}
-        if self.cfg["game_mode"]:
+        self.layout_compact = self._want_compact() if compact is None else compact
+        if self.layout_compact:
             self._build_compact()
         else:
             self._build_full()
@@ -1170,6 +1241,15 @@ class Overlay:
         items["active"] = i
         self.io_items[name] = items
 
+    def _relayout(self):
+        """Switch between the one-line and full layouts if the wanted one changed."""
+        if self._want_compact() == self.layout_compact:
+            return
+        self._rebuild()
+        self.pinger.set_active(self.visible and self.layout_compact)
+        if self.visible:
+            self._update()
+
     def set_game_mode(self, on, manual=True):
         """Game mode shrinks the overlay to one line: RAM / GPU / network / ping.
 
@@ -1178,18 +1258,40 @@ class Overlay:
         """
         if manual:
             self.auto_active = False
-        right, y = self.root.winfo_x() + self.w, self.root.winfo_y()
         self.cfg["game_mode"] = on
-        self._build_rows()
-        # Keep the right edge fixed so a top-right overlay stays in the corner.
-        self.root.geometry(f"+{right - self.w}+{y}")
-        self.root.update_idletasks()  # apply the move so _save() reads the new position
-        self._update()
+        self._relayout()
         self._save()
         self.tray.icon = tray_image(on, not self.visible)
         self.tray.update_menu()
         if self.popup:
             self.popup.refresh()
+
+    # ---- full view on the desktop ----------------------------------------
+
+    def set_desktop_detail(self, on):
+        self.cfg["desktop_detail"] = on
+        self._relayout()
+        self._save()
+
+    def _desktop_in_front(self):
+        """True for the desktop, False for an app window, None for the taskbar,
+        Start, Alt+Tab, this overlay's own windows and the like (no change)."""
+        fg = foreground_window()
+        if fg is None:
+            return None
+        cls, pid = fg
+        if cls in DESKTOP_CLASSES:
+            return True
+        if cls in SHELL_CLASSES or pid == os.getpid() or self._process_name(pid) in SHELL_HOSTS:
+            return None
+        return False
+
+    def _follow_desktop(self):
+        """Full layout while the desktop is in front, one line once an app is."""
+        front = self._desktop_in_front()
+        if front is not None and front != self.on_desktop:
+            self.on_desktop = front
+            self._relayout()
 
     # ---- auto game mode --------------------------------------------------
 
@@ -1244,11 +1346,18 @@ class Overlay:
         m = round(12 * self.s)
         return r - self.w - m, t + m
 
-    def _place_initial(self):
+    def _place_initial(self, old_size=None):
+        """x / y in the config are where the one-line layout sits; `old_size` is
+        the layout they were saved for, if it was a different one."""
         x, y = self.cfg["x"], self.cfg["y"]
         vl, vt, vr, vb = virtual_screen()
         if x is None or y is None:
             x, y = self._top_right()
+        else:
+            if old_size:
+                x, y = self._convert((x, y, *old_size), self.compact_size)
+            if not self.layout_compact:
+                x, y = self._convert((x, y, *self.compact_size), (self.w, self.h))
         # Keep the whole overlay on screen (e.g. after a monitor was unplugged).
         x = min(max(x, vl), vr - self.w)
         y = min(max(y, vt), vb - self.h)
@@ -1384,6 +1493,7 @@ class Overlay:
         brushing past the edge doesn't make it flicker.
         """
         self.root.after(80, self._poll_cursor)
+        self._follow_desktop()  # same cadence, so Win+D shows the full view right away
         hide = False
         if self.visible and not self.editing and self.cfg["hover_hide"]:
             px, py = cursor_pos()
@@ -1413,7 +1523,10 @@ class Overlay:
         self.root.destroy()
 
     def _save(self):
-        self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        if not self.layout_compact:  # store where the one-line layout would sit
+            x, y = self._convert((x, y, self.w, self.h), self.compact_size)
+        self.cfg["x"], self.cfg["y"] = x, y
         data = dict(self.cfg)
         if self.auto_active:  # store the hand-picked mode, not the temporary one
             data["game_mode"] = False
@@ -1493,7 +1606,7 @@ class Overlay:
         # (a GPU read crash once left the overlay frozen).
         self.root.after(INTERVAL_MS, self._tick)
         self.ticks += 1
-        self.pinger.set_active(self.visible and self.cfg["game_mode"])
+        self.pinger.set_active(self.visible and self.layout_compact)
         if self.visible:
             if self.cfg["auto_game"] and self.ticks % 2 == 0:
                 self._check_game()
@@ -1570,12 +1683,12 @@ class Overlay:
         return self._proc_names[pid]
 
     def _update(self):
-        """Refresh what's shown; game mode doesn't measure CPU or disks at all."""
-        if self.cfg["game_mode"]:
+        """Refresh what's shown; the one-line layout doesn't measure CPU or disks at all."""
+        if self.layout_compact:
             self._update_compact()
             return
         if self._find_drives():  # USB storage was plugged in or removed
-            self._resize_rows()
+            self._rebuild()
         per = psutil.cpu_percent(None, percpu=True)
         cpu = sum(per) / len(per)
         self._set_row("CPU", cpu, self.t("threads", n=len(per)))
