@@ -1,14 +1,14 @@
-"""Tiny always-on-top overlay showing CPU / RAM / GPU usage, network
-throughput and free disk space.
+"""Tiny always-on-top overlay showing CPU / RAM / GPU usage and per-drive
+free space, read / write speed and active time.
 
 - The overlay ignores the mouse (clicks pass through to whatever is below).
 - Clicking the tray icon (taskbar, bottom-right) opens a settings popup:
-  show/hide the overlay for a while, game mode (RAM / GPU / NET only), edit mode (drag to move), reset position,
+  show/hide the overlay for a while, game mode (RAM / GPU / network / ping), edit mode (drag to move), reset position,
   opacity, run at startup, language (Korean / English), exit. Right-click the
   icon for quick toggles. In edit mode, double-click the overlay (or press
   Done in the popup) to finish.
 - Settings live in perf_overlay.json next to this script ("drives" picks
-  which drives to show).
+  which drives to show; plugged-in USB storage is added by itself).
 
 Requires: psutil, pystray, pillow. GPU stats use nvml.dll, which ships with
 the NVIDIA driver.
@@ -18,6 +18,7 @@ import ctypes.wintypes as wintypes
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -70,7 +71,7 @@ STRINGS = {
         "show": "오버레이 표시",
         "show_sub": "끄면 다시 켤 때까지 숨김",
         "game": "게임 모드",
-        "game_sub": "RAM · GPU · 네트워크만 한 줄로 표시",
+        "game_sub": "RAM · GPU · 네트워크 · 핑을 한 줄로 표시",
         "position": "위치",
         "move": "위치 편집",
         "done": "완료",
@@ -93,12 +94,15 @@ STRINGS = {
         "threads": "{n} 스레드",
         "disk_used": "{pct}% 사용 / {total}",
         "disk_free": "{free} 여유",
+        "disk_read": "읽기",
+        "disk_write": "쓰기",
+        "disk_active": "활성",
     },
     "en": {
         "show": "Show overlay",
         "show_sub": "Hidden until you turn it back on",
         "game": "Game mode",
-        "game_sub": "Just RAM · GPU · network on one line",
+        "game_sub": "RAM · GPU · network · ping on one line",
         "position": "Position",
         "move": "Move",
         "done": "Done",
@@ -121,6 +125,9 @@ STRINGS = {
         "threads": "{n} threads",
         "disk_used": "{pct}% of {total}",
         "disk_free": "{free} free",
+        "disk_read": "R",
+        "disk_write": "W",
+        "disk_active": "busy",
     },
 }
 LANGUAGES = [("ko", "한국어"), ("en", "English")]
@@ -209,43 +216,251 @@ class Gpu:
         return util.gpu, mem.used / 2**30, mem.total / 2**30
 
 
+
+class _DiskPerf(ctypes.Structure):
+    """DISK_PERFORMANCE; times are in 100 ns units."""
+    _fields_ = [("bytes_read", ctypes.c_longlong), ("bytes_written", ctypes.c_longlong),
+                ("read_time", ctypes.c_longlong), ("write_time", ctypes.c_longlong),
+                ("idle_time", ctypes.c_longlong), ("read_count", wintypes.DWORD),
+                ("write_count", wintypes.DWORD), ("queue_depth", wintypes.DWORD),
+                ("split_count", wintypes.DWORD), ("query_time", ctypes.c_longlong),
+                ("device_number", wintypes.DWORD), ("manager", wintypes.WCHAR * 8)]
+
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateFileW.restype = wintypes.HANDLE
+_k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+_k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                 wintypes.LPVOID, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+_k32.CloseHandle.argtypes = [wintypes.HANDLE]
+_k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+INVALID_HANDLE = wintypes.HANDLE(-1).value
+IOCTL_DISK_PERFORMANCE = 0x70020
+IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
+DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
+PLUG_IN_BUSES = {7, 12, 13}  # STORAGE_BUS_TYPE: USB, SD, MMC
+
+
+class _StorageQuery(ctypes.Structure):
+    """STORAGE_PROPERTY_QUERY; all zeros asks for the device descriptor."""
+    _fields_ = [("property_id", wintypes.DWORD), ("query_type", wintypes.DWORD),
+                ("extra", ctypes.c_ubyte * 4)]
+
+
+class _StorageDevice(ctypes.Structure):
+    """STORAGE_DEVICE_DESCRIPTOR, with room for the id strings Windows appends."""
+    _fields_ = [("version", wintypes.DWORD), ("size", wintypes.DWORD),
+                ("device_type", ctypes.c_ubyte), ("device_type_modifier", ctypes.c_ubyte),
+                ("removable_media", ctypes.c_ubyte), ("command_queueing", ctypes.c_ubyte),
+                ("vendor_offset", wintypes.DWORD), ("product_offset", wintypes.DWORD),
+                ("revision_offset", wintypes.DWORD), ("serial_offset", wintypes.DWORD),
+                ("bus_type", wintypes.DWORD), ("raw_length", wintypes.DWORD),
+                ("raw", ctypes.c_ubyte * 1024)]
+
+
+def open_volume(drive):
+    """Handle to a volume (e.g. C:), or None. No read/write access, so no admin needed."""
+    h = _k32.CreateFileW("\\\\.\\" + drive.rstrip("\\"), 0, 3, None, 3, 0, None)  # share r/w, OPEN_EXISTING
+    return None if h in (None, INVALID_HANDLE) else h
+
+
+def is_plug_in(drive):
+    """True for storage that gets plugged in: USB sticks, external disks, memory cards.
+
+    An external disk calls itself a fixed drive just like an internal one, so
+    the bus it's attached through decides.
+    """
+    kind = _k32.GetDriveTypeW(drive)
+    if kind == DRIVE_REMOVABLE:
+        return True
+    if kind != DRIVE_FIXED:  # network, CD, RAM disk
+        return False
+    h = open_volume(drive)
+    if h is None:
+        return False
+    q, d, n = _StorageQuery(), _StorageDevice(), wintypes.DWORD()
+    ok = _k32.DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, ctypes.byref(q), ctypes.sizeof(q),
+                              ctypes.byref(d), ctypes.sizeof(d), ctypes.byref(n), None)
+    _k32.CloseHandle(h)
+    return bool(ok) and d.bus_type in PLUG_IN_BUSES
+
+
+class DiskIO:
+    """Read / write throughput and active time of one volume (e.g. C:).
+
+    Asks the volume itself (IOCTL_DISK_PERFORMANCE), so it's per drive letter
+    even when several share a physical disk, and needs no admin: the handle is
+    opened with no read/write access. Active time is Task Manager's "활성
+    시간": the share of the interval the volume had I/O in flight.
+    """
+
+    RETRY_S = 10
+
+    def __init__(self, drive):
+        self.drive = drive
+        # A handle left open would keep Windows from safely removing the drive.
+        self.hold = not is_plug_in(drive)
+        self.handle = None
+        self.last = None
+        self.retry_at = 0.0
+
+    def _release(self):
+        if self.handle is not None:
+            _k32.CloseHandle(self.handle)
+        self.handle = None
+
+    def close(self):
+        self._release()
+        self.last = None
+
+    def read(self):
+        """Returns (read B/s, write B/s, active %), or None if unavailable."""
+        if self.handle is None:
+            if time.monotonic() < self.retry_at:
+                return None
+            self.handle = open_volume(self.drive)
+            if self.handle is None:
+                self.retry_at = time.monotonic() + self.RETRY_S
+                return None
+        p, n = _DiskPerf(), wintypes.DWORD()
+        if not _k32.DeviceIoControl(self.handle, IOCTL_DISK_PERFORMANCE, None, 0, ctypes.byref(p),
+                                    ctypes.sizeof(p), ctypes.byref(n), None):
+            self.close()  # e.g. the drive was removed; reopen later
+            self.retry_at = time.monotonic() + self.RETRY_S
+            return None
+        if not self.hold:
+            self._release()
+        prev, self.last = self.last, p
+        if prev is None:
+            return 0.0, 0.0, 0.0
+        span = p.query_time - prev.query_time  # 100 ns units
+        if not 0 < span < 3e7:  # >3 s: not sampled meanwhile (hidden / game mode); start over
+            return 0.0, 0.0, 0.0
+        sec = span / 1e7
+        rd = max(0, p.bytes_read - prev.bytes_read) / sec
+        wr = max(0, p.bytes_written - prev.bytes_written) / sec
+        active = 100.0 * (1 - (p.idle_time - prev.idle_time) / span)
+        return rd, wr, max(0.0, min(100.0, active))
+
+
+class _Guid(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+
+class _IfRow2(ctypes.Structure):
+    """MIB_IF_ROW2 (1352 bytes); only InterfaceIndex, InOctets and OutOctets are used."""
+    _fields_ = [("luid", ctypes.c_uint64), ("index", wintypes.ULONG), ("guid", _Guid),
+                ("alias", wintypes.WCHAR * 257), ("description", wintypes.WCHAR * 257),
+                ("phys_len", wintypes.ULONG), ("phys", ctypes.c_ubyte * 32),
+                ("perm_phys", ctypes.c_ubyte * 32), ("mtu", wintypes.ULONG),
+                ("type", wintypes.ULONG), ("tunnel_type", ctypes.c_int),
+                ("media_type", ctypes.c_int), ("phys_medium", ctypes.c_int),
+                ("access_type", ctypes.c_int), ("direction", ctypes.c_int),
+                ("flags", ctypes.c_ubyte), ("oper_status", ctypes.c_int),
+                ("admin_status", ctypes.c_int), ("connect_state", ctypes.c_int),
+                ("network_guid", _Guid), ("connection_type", ctypes.c_int),
+                ("tx_speed", ctypes.c_uint64), ("rx_speed", ctypes.c_uint64),
+                ("in_octets", ctypes.c_uint64)] + [
+                (f"_c{i}", ctypes.c_uint64) for i in range(8)] + [
+                ("out_octets", ctypes.c_uint64)] + [
+                (f"_d{i}", ctypes.c_uint64) for i in range(8)]
+
+
+_iphlp = ctypes.WinDLL("iphlpapi")
+_iphlp.IcmpCreateFile.restype = wintypes.HANDLE
+_iphlp.IcmpSendEcho.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.WORD,
+                                wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD]
+
+
+def ipv4(host):
+    """IPv4 address as the integer Windows' IPAddr expects, or None if it can't resolve."""
+    try:
+        return int.from_bytes(socket.inet_aton(socket.gethostbyname(host)), "little")
+    except OSError:
+        return None
+
+
 class Net:
-    """Throughput of the busiest active adapter (e.g. 이더넷), loopback excluded."""
+    """Down / up speed of the adapter Windows routes internet traffic through.
+
+    Reads just that one adapter (GetIfEntry2, ~50 µs) instead of listing every
+    adapter, virtual ones included (psutil, ~6 ms). Only used in game mode.
+    """
+
+    ROUTE_DEST = ipv4("1.1.1.1")  # any internet address works; it only picks the route
+    REPICK_S = 30                 # follow a switch to Wi-Fi / VPN
 
     def __init__(self):
-        self.nic = None
-        self.speed = 0  # link speed, Mbps
+        self.row = _IfRow2()
+        self.picked_at = -1e9
         self.last = None
 
     def _pick(self):
-        stats = psutil.net_if_stats()
-        io = psutil.net_io_counters(pernic=True)
-        live = [n for n, s in stats.items()
-                if s.isup and s.speed > 0 and n in io and "loopback" not in n.lower()]
-        nic = max(live, key=lambda n: io[n].bytes_recv + io[n].bytes_sent, default=None)
-        self.nic, self.speed, self.last = nic, stats[nic].speed if nic else 0, None
+        idx = wintypes.DWORD()
+        self.picked_at = time.monotonic()
+        if _iphlp.GetBestInterface(wintypes.DWORD(self.ROUTE_DEST), ctypes.byref(idx)) != 0:
+            return False
+        if idx.value != self.row.index:
+            self.row.index, self.last = idx.value, None
+        return True
 
     def read(self):
-        """Returns (down B/s, up B/s, link Mbps), or None if no adapter is up."""
-        io = psutil.net_io_counters(pernic=True)
-        if self.nic not in io:
-            self._pick()
-            if self.nic is None:
-                return None
-        c, now = io[self.nic], time.monotonic()
-        prev, self.last = self.last, (c.bytes_recv, c.bytes_sent, now)
-        if prev is None:
-            return 0.0, 0.0, self.speed
-        dt = max(now - prev[2], 1e-6)
-        return (c.bytes_recv - prev[0]) / dt, (c.bytes_sent - prev[1]) / dt, self.speed
+        """Returns (down B/s, up B/s), or None while offline."""
+        now = time.monotonic()
+        if now - self.picked_at > self.REPICK_S and not self._pick():
+            self.last = None
+            return None
+        if _iphlp.GetIfEntry2(ctypes.byref(self.row)) != 0:
+            self.picked_at, self.last = -1e9, None  # adapter gone; pick again next time
+            return None
+        prev, self.last = self.last, (self.row.in_octets, self.row.out_octets, now)
+        if prev is None or not 0 < now - prev[2] < 3:  # first read, or not sampled meanwhile
+            return 0.0, 0.0
+        dt = now - prev[2]
+        return (self.row.in_octets - prev[0]) / dt, (self.row.out_octets - prev[1]) / dt
 
 
-def fmt_rate(bps):
-    for unit in ("B/s", "KB/s", "MB/s"):
-        if bps < 1024:
-            return f"{bps:.0f} {unit}" if unit == "B/s" else f"{bps:.1f} {unit}"
-        bps /= 1024
-    return f"{bps:.1f} GB/s"
+class Pinger:
+    """Pings `host` once a second on its own thread while active (game mode).
+
+    `rtt` is the last round trip in ms, -1 after a lost ping, None until the
+    first reply. Plain ICMP echo, so no admin is needed.
+    """
+
+    TIMEOUT_MS = 1000
+
+    def __init__(self, host):
+        self.host, self.addr = host, None
+        self.rtt = None
+        self.active = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set_active(self, on):
+        if on and not self.active.is_set():
+            self.rtt = None  # don't show a value from the last game
+            self.active.set()
+        elif not on:
+            self.active.clear()
+
+    def _run(self):
+        handle = _iphlp.IcmpCreateFile()
+        reply = ctypes.create_string_buffer(64)
+        data = b"perf"
+        while True:
+            self.active.wait()
+            start = time.monotonic()
+            if self.addr is None:
+                self.addr = ipv4(self.host)
+            if self.addr is None:
+                self.rtt = -1
+            elif _iphlp.IcmpSendEcho(handle, self.addr, data, len(data), None, reply,
+                                     len(reply), self.TIMEOUT_MS):
+                self.rtt = int.from_bytes(reply.raw[8:12], "little")  # RoundTripTime
+            else:
+                self.rtt = -1
+            time.sleep(max(0.0, 1.0 - (time.monotonic() - start)))
 
 
 def fmt_rate_short(bps):
@@ -255,6 +470,17 @@ def fmt_rate_short(bps):
         return f"{k:.0f}K"
     m = k / 1024
     return f"{m:.1f}M" if m < 9.95 else f"{m:.0f}M"
+
+
+def fmt_rate(bps):
+    """At most 8 characters: 0 B/s, 512 KB/s, 3.4 MB/s, 85 MB/s, 1.2 GB/s."""
+    for unit in ("B/s", "KB/s", "MB/s"):
+        if bps < 999.5:
+            if unit == "B/s" or bps >= 9.95:
+                return f"{bps:.0f} {unit}"
+            return f"{bps:.1f} {unit}"
+        bps /= 1024
+    return f"{bps:.1f} GB/s"
 
 
 def fmt_size(nbytes):
@@ -692,7 +918,7 @@ class Overlay:
         self.cfg = {"x": None, "y": None, "alpha": 0.85, "drives": ["C:\\", "D:\\"],
                     "game_mode": False, "lang": default_language(),
                     "auto_game": True, "extra_games": [], "not_games": [],
-                    "hover_hide": True}
+                    "hover_hide": True, "ping_host": "1.1.1.1", "usb_drives": True}
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 self.cfg.update(json.load(f))
@@ -702,8 +928,10 @@ class Overlay:
             self.cfg["lang"] = "en"
 
         self.gpu = Gpu()
-        self.net = Net()
-        self.drives = [d for d in self.cfg["drives"] if os.path.exists(d)]
+        self.net = Net()  # game mode only
+        self.pinger = Pinger(self.cfg["ping_host"])
+        self.drives, self.disk_io, self.usage = [], {}, {}
+        self._find_drives()
         psutil.cpu_percent(None, percpu=True)  # first call always returns 0; prime it
         self.editing = False
         self.visible = True  # deliberately not saved: hiding is only "for a while"
@@ -768,6 +996,7 @@ class Overlay:
             return
         self.cfg["lang"] = lang
         self._save()
+        self._build_rows()  # the drive lines' 읽기 / 쓰기 labels are drawn once
         if self.visible:
             self._update()
         self.tray.update_menu()
@@ -775,13 +1004,52 @@ class Overlay:
             self.popup.close()
             self.popup = SettingsPopup(self)
 
+    # ---- drives ----------------------------------------------------------
+
+    def _find_drives(self):
+        """Pick the drives to show: the configured ones plus plugged-in USB storage.
+
+        Returns True if the list changed. Drives that can't be read right now
+        (unplugged, a card reader with no card in it) are left out.
+        """
+        drives = list(self.cfg["drives"])
+        if self.cfg["usb_drives"]:
+            listed = {d[:1].upper() for d in drives}
+            mask = _k32.GetLogicalDrives()  # bit 0 = A:
+            drives += [d for d in (f"{chr(65 + i)}:\\" for i in range(26) if mask >> i & 1)
+                       if d[0] not in listed and is_plug_in(d)]
+        self.usage = {}
+        for d in drives:
+            try:
+                self.usage[d] = psutil.disk_usage(d)
+            except OSError:
+                pass
+        drives = list(self.usage)
+        if drives == self.drives:
+            return False
+        old, self.drives, self.disk_io = self.disk_io, drives, {}
+        for d in drives:
+            name = d.rstrip("\\")
+            self.disk_io[name] = old.pop(name, None) or DiskIO(d)
+        for io in old.values():
+            io.close()
+        return True
+
+    def _resize_rows(self):
+        """Redraw after a drive row came or went, growing away from the nearer screen edge."""
+        x, y, h = self.root.winfo_x(), self.root.winfo_y(), self.h
+        self._build_rows()
+        _, top, _, bottom = virtual_screen()
+        if y + h / 2 > (top + bottom) / 2:  # in the lower half: keep the bottom edge in place
+            self.root.geometry(f"+{x}+{y + h - self.h}")
+
     # ---- layout ----------------------------------------------------------
 
     def _build_rows(self):
         """(Re)draw the layout for the current mode and resize the window to fit."""
         c = self.canvas
         c.delete("all")
-        self.items, self.cores, self.compact = {}, [], {}
+        self.items, self.cores, self.compact, self.io_items = {}, [], {}, {}
         if self.cfg["game_mode"]:
             self._build_compact()
         else:
@@ -794,7 +1062,7 @@ class Overlay:
         self.root.geometry(f"{self.w}x{self.h}")  # keeps the current position
 
     def _build_compact(self):
-        """Game mode: one line of numbers, e.g.  RAM 65%  GPU 99%  ↓2.1M ↑5K"""
+        """Game mode: one line of numbers, e.g.  RAM 65%  GPU 99%  ↓2.1M ↑5K  PING 15ms"""
         s, c = self.s, self.canvas
         self.h = round(22 * s)
         ty = self.h / 2
@@ -825,16 +1093,20 @@ class Overlay:
         label("↓")
         value("down", "999M", 4, align="w")
         label("↑")
-        value("up", "999M", 0, align="w")
+        value("up", "999M", 8, align="w")
+        label("PING")
+        value("ping", "999ms", 0)
         self.w = x + round(8 * s)
 
     def _build_full(self):
         s, c = self.s, self.canvas
         self.w = self.full_w
-        rows = ["CPU", "RAM", "GPU", "NET"] + [d.rstrip("\\") for d in self.drives]
+        rows = ["CPU", "RAM", "GPU"] + [d.rstrip("\\") for d in self.drives]
         core_h, core_gap = round(18 * s), round(4 * s)
         strip_h = round(4 * s) + core_h + core_gap  # per-thread strip under the CPU row
-        self.h = self.pad * 2 + self.row_h * len(rows) - round(6 * s) + strip_h
+        io_h = round(14 * s)  # read / write / active line under each drive row
+        self.h = (self.pad * 2 + self.row_h * len(rows) - round(6 * s) + strip_h
+                  + io_h * len(self.drives))
 
         label_font = ("Segoe UI Semibold", 9)
         detail_font = ("Segoe UI", 8)
@@ -864,9 +1136,42 @@ class Overlay:
                                             fill=load_color(0), width=0)
                     self.cores.append((cb, cx0, cx0 + cw, top, bottom))
                 offset = strip_h
+            elif name in self.disk_io:  # a drive
+                self._build_io_line(name, x0, x1, by1 + round(9 * s))
+                offset += io_h
+
+    def _build_io_line(self, name, x0, x1, ty):
+        """`읽기 54 MB/s  쓰기 1.2 MB/s      활성 23%` under a drive's space bar.
+
+        Value slots are sized for their widest text so nothing shifts as numbers change.
+        """
+        s, c = self.s, self.canvas
+        label_font, value_font = ("Segoe UI", 8), ("Consolas", 8)
+
+        def slot(x, widest, anchor_left):
+            i = c.create_text(x, ty, text=widest, font=value_font,
+                              anchor="w" if anchor_left else "e")
+            box = c.bbox(i)
+            c.itemconfigure(i, text="--", fill=DIM)
+            return i, box
+
+        items, x = {}, x0
+        for key in ("read", "write"):
+            lbl = c.create_text(x, ty, text=self.t("disk_" + key), fill=DIM, font=label_font,
+                                anchor="w")
+            i, box = slot(c.bbox(lbl)[2] + round(3 * s), "999 MB/s", True)
+            c.coords(i, box[2], ty)  # right-align within the slot
+            c.itemconfigure(i, anchor="e")
+            items[key] = i
+            x = box[2] + round(10 * s)
+        i, box = slot(x1, "100%", False)
+        c.create_text(box[0] - round(3 * s), ty, text=self.t("disk_active"), fill=DIM,
+                      font=label_font, anchor="e")
+        items["active"] = i
+        self.io_items[name] = items
 
     def set_game_mode(self, on, manual=True):
-        """Game mode shrinks the overlay to one line: RAM / GPU / NET.
+        """Game mode shrinks the overlay to one line: RAM / GPU / network / ping.
 
         A manual change takes over from auto mode: it's not undone when the
         detected game exits.
@@ -1136,6 +1441,19 @@ class Overlay:
         # Keep the detail text just left of the value, whose width varies.
         c.coords(d, c.bbox(v)[0] - round(8 * self.s), ty)
 
+    def _set_io(self, name, io):
+        """Fill a drive's read / write / active line; idle numbers stay dim."""
+        c, k = self.canvas, self.io_items[name]
+        if io is None:
+            for key in k:
+                c.itemconfigure(k[key], text="N/A" if key == "active" else "--", fill=DIM)
+            return
+        rd, wr, active = io
+        for key, bps in (("read", rd), ("write", wr)):
+            c.itemconfigure(k[key], text=fmt_rate(bps), fill=FG if bps >= 1024 else DIM)
+        c.itemconfigure(k["active"], text=f"{active:.0f}%",
+                        fill=DIM if active < 1 else FG if active < 60 else load_color(active))
+
     def _update_compact(self):
         c, k = self.canvas, self.compact
         # Plain white while fine; only warn colors (>=60%) stand out.
@@ -1152,19 +1470,30 @@ class Overlay:
             c.itemconfigure(k["GPU"], text=f"{g[0]}%", fill=tint(g[0]))
             gpu_txt = f"{g[0]}%"
 
-        down, up, _ = self.net.read() or (0.0, 0.0, 0)
+        down, up = self.net.read() or (0.0, 0.0)
         c.itemconfigure(k["down"], text=fmt_rate_short(down))
         c.itemconfigure(k["up"], text=fmt_rate_short(up))
 
+        rtt = self.pinger.rtt
+        if rtt is None:
+            ping_txt, color = "--", DIM
+        elif rtt < 0:  # lost
+            ping_txt, color = "--", load_color(100)
+        else:
+            ping_txt = f"{min(rtt, 999)}ms"
+            color = FG if rtt < 80 else load_color(60 if rtt < 150 else 100)
+        c.itemconfigure(k["ping"], text=ping_txt, fill=color)
+
         tip = self.t("game_tip_auto" if self.auto_active else "game_tip")
         self.tray.title = (f"{tip} RAM {vm.percent:.0f}% · GPU {gpu_txt} · "
-                           f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)}")
+                           f"↓ {fmt_rate(down)} ↑ {fmt_rate(up)} · PING {ping_txt}")
 
     def _tick(self):
         # Schedule first: an error below gets logged but must not stop the loop
         # (a GPU read crash once left the overlay frozen).
         self.root.after(INTERVAL_MS, self._tick)
         self.ticks += 1
+        self.pinger.set_active(self.visible and self.cfg["game_mode"])
         if self.visible:
             if self.cfg["auto_game"] and self.ticks % 2 == 0:
                 self._check_game()
@@ -1245,6 +1574,8 @@ class Overlay:
         if self.cfg["game_mode"]:
             self._update_compact()
             return
+        if self._find_drives():  # USB storage was plugged in or removed
+            self._resize_rows()
         per = psutil.cpu_percent(None, percpu=True)
         cpu = sum(per) / len(per)
         self._set_row("CPU", cpu, self.t("threads", n=len(per)))
@@ -1265,24 +1596,12 @@ class Overlay:
             self._set_row("GPU", util, f"VRAM {used:.1f} / {total:.0f} GB")
             gpu_txt = f"{util}%"
 
-        net = self.net.read()
-        if net is None:
-            self._set_row("NET", None)
-        else:
-            down, up, mbps = net
-            pct = max(down, up) * 8 / (mbps * 1e6) * 100 if mbps else 0
-            self._set_row("NET", pct, f"↑ {fmt_rate(up)}", f"↓ {fmt_rate(down)}")
-
-        for drive in self.drives:
-            name = drive.rstrip("\\")
-            try:
-                u = psutil.disk_usage(drive)
-            except OSError:
-                self._set_row(name, None)
-                continue
-            self._set_row(name, u.percent,
+        for drive, u in self.usage.items():
+            self._set_row(drive.rstrip("\\"), u.percent,
                           self.t("disk_used", pct=f"{u.percent:.0f}", total=fmt_size(u.total)),
                           self.t("disk_free", free=fmt_size(u.free)))
+        for name, io in self.disk_io.items():
+            self._set_io(name, io.read())
 
         self.tray.title = f"CPU {cpu:.0f}% · RAM {vm.percent:.0f}% · GPU {gpu_txt}"
 
@@ -1318,6 +1637,8 @@ if __name__ == "__main__":
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
+    # SEM_FAILCRITICALERRORS: no "insert a disk" dialog when an empty card reader is checked.
+    ctypes.windll.kernel32.SetErrorMode(1)
     try:
         migrate_legacy_startup()
         Overlay().run()
